@@ -7,7 +7,7 @@ rules:
 - apiGroups:
   - dbaas.opencloud.wso2.com
   resources:
-  - databases
+  - dbinstances
   verbs:
   - create
   - delete
@@ -19,13 +19,13 @@ rules:
 - apiGroups:
   - dbaas.opencloud.wso2.com
   resources:
-  - databases/finalizers
+  - dbinstances/finalizers
   verbs:
   - update
 - apiGroups:
   - dbaas.opencloud.wso2.com
   resources:
-  - databases/status
+  - dbinstances/status
   verbs:
   - get
   - patch

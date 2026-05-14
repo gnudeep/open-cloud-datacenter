@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -37,6 +38,7 @@ import (
 
 	dbaasv1alpha1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/controller"
+	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/gateway"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -59,12 +61,15 @@ func main() {
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
 	var probeAddr string
+	var gatewayAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&gatewayAddr, "gateway-address", ":8080",
+		"The address the DBInstance REST API gateway binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -178,11 +183,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.DatabaseReconciler{
+	if err := (&controller.DBInstanceReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "database")
+		setupLog.Error(err, "Failed to create controller", "controller", "dbinstance")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
@@ -196,8 +201,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := ctrl.SetupSignalHandler()
+
+	// Start the DBInstance REST API gateway alongside the controller. It waits
+	// for the manager's cache to sync before serving so reads are consistent.
+	go func() {
+		if !mgr.GetCache().WaitForCacheSync(ctx) {
+			setupLog.Error(fmt.Errorf("cache sync failed"), "Gateway startup aborted")
+			return
+		}
+		setupLog.Info("Starting REST API gateway", "address", gatewayAddr)
+		if err := gateway.RunGateway(gatewayAddr, mgr.GetClient()); err != nil {
+			setupLog.Error(err, "Gateway exited with error")
+		}
+	}()
+
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}

@@ -1,0 +1,18 @@
+apiVersion: dbaas.opencloud.wso2.com/v1alpha1
+kind: DBInstance
+metadata:
+  labels:
+    app.kubernetes.io/name: dbaas
+    app.kubernetes.io/managed-by: kustomize
+  name: dbinstance-sample
+spec:
+  dbInstanceClass: db.t3.medium
+  allocatedStorage: 50
+  engineVersion: "16"
+  dbName: myapp
+  masterUsername: dbadmin
+  manageMasterUserPassword: true
+  dbSubnetGroupName: "10.50.0.0/24"
+  backupRetentionPeriod: 7
+  deletionProtection: true
+  running: true

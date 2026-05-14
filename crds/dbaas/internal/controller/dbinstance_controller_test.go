@@ -30,7 +30,7 @@ import (
 	dbaasv1alpha1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
 )
 
-var _ = Describe("Database Controller", func() {
+var _ = Describe("DBInstance Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
 
@@ -40,13 +40,13 @@ var _ = Describe("Database Controller", func() {
 			Name:      resourceName,
 			Namespace: "default", // TODO(user):Modify as needed
 		}
-		database := &dbaasv1alpha1.Database{}
+		dbinstance := &dbaasv1alpha1.DBInstance{}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind Database")
-			err := k8sClient.Get(ctx, typeNamespacedName, database)
+			By("creating the custom resource for the Kind DBInstance")
+			err := k8sClient.Get(ctx, typeNamespacedName, dbinstance)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &dbaasv1alpha1.Database{
+				resource := &dbaasv1alpha1.DBInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: "default",
@@ -59,16 +59,16 @@ var _ = Describe("Database Controller", func() {
 
 		AfterEach(func() {
 			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &dbaasv1alpha1.Database{}
+			resource := &dbaasv1alpha1.DBInstance{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Cleanup the specific resource instance Database")
+			By("Cleanup the specific resource instance DBInstance")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &DatabaseReconciler{
+			controllerReconciler := &DBInstanceReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}

@@ -15,7 +15,7 @@ resources:
   controller: true
   domain: opencloud.wso2.com
   group: dbaas
-  kind: Database
+  kind: DBInstance
   path: github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1
   version: v1alpha1
 version: "3"

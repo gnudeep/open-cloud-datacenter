@@ -11,17 +11,17 @@ metadata:
   labels:
     app.kubernetes.io/name: dbaas
     app.kubernetes.io/managed-by: kustomize
-  name: database-admin-role
+  name: dbinstance-admin-role
 rules:
 - apiGroups:
   - dbaas.opencloud.wso2.com
   resources:
-  - databases
+  - dbinstances
   verbs:
   - '*'
 - apiGroups:
   - dbaas.opencloud.wso2.com
   resources:
-  - databases/status
+  - dbinstances/status
   verbs:
   - get
