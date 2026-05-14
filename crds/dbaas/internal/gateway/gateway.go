@@ -47,6 +47,12 @@ type Server struct {
 
 // RunGateway starts the HTTP gateway and blocks until the server exits.
 func RunGateway(addr string, k8sClient client.Client) error {
+	return http.ListenAndServe(addr, NewHandler(k8sClient))
+}
+
+// NewHandler builds the gateway's HTTP handler: route registration without
+// the listening server, so it can be exercised directly in tests.
+func NewHandler(k8sClient client.Client) http.Handler {
 	srv := &Server{k8sClient: k8sClient}
 
 	mux := http.NewServeMux()
@@ -71,7 +77,7 @@ func RunGateway(addr string, k8sClient client.Client) error {
 		srv.handleInstanceRoute(w, r)
 	})
 
-	return http.ListenAndServe(addr, mux)
+	return mux
 }
 
 // defaultNamespace returns the namespace DBInstances are read from and written

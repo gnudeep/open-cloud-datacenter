@@ -1,0 +1,269 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	dbaasv1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
+)
+
+// newHandler builds a gateway handler backed by a fake client seeded with objs,
+// and returns both so tests can assert on the resulting cluster state.
+func newHandler(t *testing.T, objs ...client.Object) (http.Handler, client.Client) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := dbaasv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add dbaas scheme: %v", err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	return NewHandler(c), c
+}
+
+// sampleInstance returns a DBInstance in the gateway's default namespace.
+func sampleInstance(name string) *dbaasv1.DBInstance {
+	running := true
+	return &dbaasv1.DBInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: defaultNamespace()},
+		Spec: dbaasv1.DBInstanceSpec{
+			DBInstanceClass:  "db.t3.medium",
+			AllocatedStorage: 50,
+			DBName:           "myapp",
+			Running:          &running,
+		},
+	}
+}
+
+// do issues an HTTP request against h. A string body is sent verbatim (handy
+// for malformed-JSON cases); any other body is JSON-encoded.
+func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var r io.Reader
+	switch b := body.(type) {
+	case nil:
+		// no body
+	case string:
+		r = strings.NewReader(b)
+	default:
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		r = bytes.NewReader(raw)
+	}
+	req := httptest.NewRequest(method, path, r)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func getInstance(t *testing.T, c client.Client, name string) *dbaasv1.DBInstance {
+	t.Helper()
+	var inst dbaasv1.DBInstance
+	key := types.NamespacedName{Namespace: defaultNamespace(), Name: name}
+	if err := c.Get(context.Background(), key, &inst); err != nil {
+		t.Fatalf("get %q: %v", name, err)
+	}
+	return &inst
+}
+
+func TestHealthz(t *testing.T) {
+	h, _ := newHandler(t)
+
+	if rec := do(t, h, http.MethodGet, "/healthz", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz: got %d, want 200", rec.Code)
+	}
+	if rec := do(t, h, http.MethodDelete, "/healthz", nil); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE /healthz: got %d, want 405", rec.Code)
+	}
+}
+
+func TestCreateInstance(t *testing.T) {
+	h, c := newHandler(t)
+
+	rec := do(t, h, http.MethodPost, "/dbinstances", sampleInstance("orders"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /dbinstances: got %d, want 202 (body: %s)", rec.Code, rec.Body)
+	}
+	inst := getInstance(t, c, "orders")
+	if inst.Spec.DBInstanceClass != "db.t3.medium" || inst.Spec.AllocatedStorage != 50 {
+		t.Fatalf("created instance spec not persisted: %+v", inst.Spec)
+	}
+
+	// Duplicate name -> 409.
+	if rec := do(t, h, http.MethodPost, "/dbinstances", sampleInstance("orders")); rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate POST: got %d, want 409", rec.Code)
+	}
+
+	// Missing metadata.name -> 400.
+	noName := &dbaasv1.DBInstance{Spec: dbaasv1.DBInstanceSpec{DBInstanceClass: "db.t3.micro"}}
+	if rec := do(t, h, http.MethodPost, "/dbinstances", noName); rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST without name: got %d, want 400", rec.Code)
+	}
+
+	// Malformed JSON -> 400.
+	if rec := do(t, h, http.MethodPost, "/dbinstances", "{not json"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST malformed JSON: got %d, want 400", rec.Code)
+	}
+
+	// Unsupported method on the collection -> 405.
+	if rec := do(t, h, http.MethodPut, "/dbinstances", nil); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT /dbinstances: got %d, want 405", rec.Code)
+	}
+}
+
+func TestListInstances(t *testing.T) {
+	h, _ := newHandler(t, sampleInstance("a"), sampleInstance("b"))
+
+	rec := do(t, h, http.MethodGet, "/dbinstances", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dbinstances: got %d, want 200", rec.Code)
+	}
+	var list dbaasv1.DBInstanceList
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("list length: got %d, want 2", len(list.Items))
+	}
+}
+
+func TestGetInstance(t *testing.T) {
+	h, _ := newHandler(t, sampleInstance("orders"))
+
+	rec := do(t, h, http.MethodGet, "/dbinstances/orders", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET existing: got %d, want 200", rec.Code)
+	}
+	var inst dbaasv1.DBInstance
+	if err := json.Unmarshal(rec.Body.Bytes(), &inst); err != nil {
+		t.Fatalf("decode instance: %v", err)
+	}
+	if inst.Name != "orders" {
+		t.Fatalf("got instance %q, want orders", inst.Name)
+	}
+
+	if rec := do(t, h, http.MethodGet, "/dbinstances/missing", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET missing: got %d, want 404", rec.Code)
+	}
+	if rec := do(t, h, http.MethodGet, "/dbinstances/", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET empty name: got %d, want 404", rec.Code)
+	}
+}
+
+func TestModifyInstance(t *testing.T) {
+	h, c := newHandler(t, sampleInstance("orders"))
+
+	rec := do(t, h, http.MethodPatch, "/dbinstances/orders", map[string]any{
+		"dbInstanceClass":       "db.m5.large",
+		"allocatedStorage":      200,
+		"backupRetentionPeriod": 14,
+		"running":               false,
+	})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("PATCH: got %d, want 202 (body: %s)", rec.Code, rec.Body)
+	}
+	inst := getInstance(t, c, "orders")
+	if inst.Spec.DBInstanceClass != "db.m5.large" {
+		t.Errorf("DBInstanceClass: got %q, want db.m5.large", inst.Spec.DBInstanceClass)
+	}
+	if inst.Spec.AllocatedStorage != 200 {
+		t.Errorf("AllocatedStorage: got %d, want 200", inst.Spec.AllocatedStorage)
+	}
+	if inst.Spec.BackupRetentionPeriod != 14 {
+		t.Errorf("BackupRetentionPeriod: got %d, want 14", inst.Spec.BackupRetentionPeriod)
+	}
+	if inst.Spec.Running == nil || *inst.Spec.Running {
+		t.Errorf("Running: got %v, want false", inst.Spec.Running)
+	}
+
+	// Fields not supplied are left untouched.
+	if inst.Spec.DBName != "myapp" {
+		t.Errorf("DBName changed unexpectedly: got %q, want myapp", inst.Spec.DBName)
+	}
+
+	if rec := do(t, h, http.MethodPatch, "/dbinstances/missing", map[string]any{"allocatedStorage": 10}); rec.Code != http.StatusNotFound {
+		t.Fatalf("PATCH missing: got %d, want 404", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPatch, "/dbinstances/orders", "{bad"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH malformed JSON: got %d, want 400", rec.Code)
+	}
+}
+
+func TestDeleteInstance(t *testing.T) {
+	h, c := newHandler(t, sampleInstance("orders"))
+
+	rec := do(t, h, http.MethodDelete, "/dbinstances/orders", nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("DELETE: got %d, want 202", rec.Code)
+	}
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: defaultNamespace(), Name: "orders"}, &dbaasv1.DBInstance{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("instance still present after delete: err=%v", err)
+	}
+
+	if rec := do(t, h, http.MethodDelete, "/dbinstances/missing", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("DELETE missing: got %d, want 404", rec.Code)
+	}
+}
+
+func TestStartStopInstance(t *testing.T) {
+	stopped := sampleInstance("orders")
+	running := false
+	stopped.Spec.Running = &running
+	h, c := newHandler(t, stopped)
+
+	if rec := do(t, h, http.MethodPost, "/dbinstances/orders/start", nil); rec.Code != http.StatusAccepted {
+		t.Fatalf("start: got %d, want 202", rec.Code)
+	}
+	if r := getInstance(t, c, "orders").Spec.Running; r == nil || !*r {
+		t.Fatalf("after start, Running: got %v, want true", r)
+	}
+
+	if rec := do(t, h, http.MethodPost, "/dbinstances/orders/stop", nil); rec.Code != http.StatusAccepted {
+		t.Fatalf("stop: got %d, want 202", rec.Code)
+	}
+	if r := getInstance(t, c, "orders").Spec.Running; r == nil || *r {
+		t.Fatalf("after stop, Running: got %v, want false", r)
+	}
+
+	if rec := do(t, h, http.MethodPost, "/dbinstances/missing/start", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("start missing: got %d, want 404", rec.Code)
+	}
+	// GET on an action path is not allowed.
+	if rec := do(t, h, http.MethodGet, "/dbinstances/orders/start", nil); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET action: got %d, want 405", rec.Code)
+	}
+	// Unknown action -> 404.
+	if rec := do(t, h, http.MethodPost, "/dbinstances/orders/restart", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown action: got %d, want 404", rec.Code)
+	}
+}
