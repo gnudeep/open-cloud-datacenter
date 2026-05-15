@@ -298,8 +298,13 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 				"volumes": []interface{}{
 					map[string]interface{}{"name": "os-disk", "dataVolume": map[string]interface{}{"name": fmt.Sprintf("pg-%s-os", p.ID)}},
 					map[string]interface{}{"name": "pgdata-disk", "dataVolume": map[string]interface{}{"name": p.DataVolumeRef}},
+					// userDataSecretRef + networkDataSecretRef must both be set
+					// explicitly: KubeVirt's legacy `secretRef` is an alias for
+					// userDataSecretRef only and silently ignores the
+					// `networkdata` key, which leaves the VM in DHCP mode.
 					map[string]interface{}{"name": "cloudinit", "cloudInitNoCloud": map[string]interface{}{
-						"secretRef": map[string]interface{}{"name": secretName},
+						"userDataSecretRef":    map[string]interface{}{"name": secretName},
+						"networkDataSecretRef": map[string]interface{}{"name": secretName},
 					}},
 				},
 			},
