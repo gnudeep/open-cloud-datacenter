@@ -90,18 +90,14 @@ type DBInstanceSpec struct {
 	OSImage string `json:"osImage,omitempty"`
 
 	// NetworkRef is a Harvester NAD reference (namespace/name) for the VLAN
-	// network the database VM attaches its data NIC to. The NAD must already
-	// exist on the cluster; the controller does not create networks.
+	// network the database VM attaches to. This is the VM's only network
+	// interface: client traffic, package install during cloud-init, and the
+	// Prometheus metrics scrape all go through it. The NAD must already exist
+	// on the cluster (the controller does not create networks) and the VLAN
+	// must have internet egress.
 	// Example: "iaas-net/vm-subnet-001".
 	// +required
 	NetworkRef string `json:"networkRef"`
-
-	// ConsumerNetwork is the Harvester NAD reference (namespace/name) for a
-	// consumer VLAN that application workloads use to reach the database
-	// directly via L2. When set, the VM gets a third NIC bridged to this
-	// network. Example: "default/vm-net-100".
-	// +optional
-	ConsumerNetwork string `json:"consumerNetwork,omitempty"`
 
 	// VMPassword sets the default console/SSH password for the VM user (ubuntu).
 	// For development and debugging only — leave empty in production.

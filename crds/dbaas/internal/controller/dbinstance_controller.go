@@ -204,22 +204,21 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	}
 
 	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
-		ID:              id,
-		Namespace:       ns,
-		CPUCores:        classSpec.CPUCores,
-		MemoryMB:        classSpec.MemoryMB,
-		OSImage:         osImage,
-		DataVolumeRef:   inst.Status.Resources.DataVolumeName,
-		NADName:         inst.Status.Resources.NADName,
-		MasterUser:      masterUser,
-		DBName:          dbName,
-		Port:            specPort(inst.Spec.Port),
-		MaxConnections:  classSpec.MaxConnections,
-		BackupEnabled:   inst.Spec.BackupRetentionPeriod > 0,
-		BackupWindow:    inst.Spec.PreferredBackupWindow,
-		S3Config:        inst.Spec.S3BackupConfig,
-		VMPassword:      inst.Spec.VMPassword,
-		ConsumerNetwork: inst.Spec.ConsumerNetwork,
+		ID:             id,
+		Namespace:      ns,
+		CPUCores:       classSpec.CPUCores,
+		MemoryMB:       classSpec.MemoryMB,
+		OSImage:        osImage,
+		DataVolumeRef:  inst.Status.Resources.DataVolumeName,
+		NADName:        inst.Status.Resources.NADName,
+		MasterUser:     masterUser,
+		DBName:         dbName,
+		Port:           specPort(inst.Spec.Port),
+		MaxConnections: classSpec.MaxConnections,
+		BackupEnabled:  inst.Spec.BackupRetentionPeriod > 0,
+		BackupWindow:   inst.Spec.PreferredBackupWindow,
+		S3Config:       inst.Spec.S3BackupConfig,
+		VMPassword:     inst.Spec.VMPassword,
 	})
 	if err != nil {
 		return r.fail(ctx, inst, "VMCreateFailed", err)

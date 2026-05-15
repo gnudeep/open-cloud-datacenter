@@ -33,16 +33,6 @@ func buildCloudInit(p VMCreateParams, adminPw, replPw, exporterPw, luksKey strin
 		)
 	}
 
-	consumerNetplan := ""
-	if p.ConsumerNetwork != "" {
-		consumerNetplan = `
-          enp3s0:
-            dhcp4: true
-            dhcp4-overrides:
-              use-routes: true
-              route-metric: 300`
-	}
-
 	vmUserBlock := ""
 	if p.VMPassword != "" {
 		vmUserBlock = fmt.Sprintf(`password: %s
@@ -83,11 +73,10 @@ write_files:
       network:
         version: 2
         ethernets:
-          enp2s0:
+          data:
+            match:
+              driver: virtio_net
             dhcp4: true
-            dhcp4-overrides:
-              use-routes: true
-              route-metric: 200%s
   - path: /etc/ssl/certs/pg-ca.crt
     encoding: b64
     permissions: "0644"
@@ -160,7 +149,6 @@ final_message: "DBaaS bootstrap complete for %s"
 		p.MaxConnections,
 		luksKey,
 		backupConfig,
-		consumerNetplan,
 		caCertB64,
 		serverCertB64,
 		serverKeyB64,

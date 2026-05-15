@@ -78,22 +78,21 @@ func NewClient(dyn dynamic.Interface, grafanaURL string) *Client {
 
 // VMCreateParams bundles everything needed to create a PostgreSQL VM.
 type VMCreateParams struct {
-	ID              string
-	Namespace       string
-	CPUCores        int
-	MemoryMB        int
-	OSImage         string
-	DataVolumeRef   string
-	NADName         string
-	MasterUser      string
-	DBName          string
-	Port            int
-	MaxConnections  int
-	BackupEnabled   bool
-	BackupWindow    string
-	S3Config        *dbaasv1.S3BackupConfig
-	VMPassword      string
-	ConsumerNetwork string
+	ID             string
+	Namespace      string
+	CPUCores       int
+	MemoryMB       int
+	OSImage        string
+	DataVolumeRef  string
+	NADName        string
+	MasterUser     string
+	DBName         string
+	Port           int
+	MaxConnections int
+	BackupEnabled  bool
+	BackupWindow   string
+	S3Config       *dbaasv1.S3BackupConfig
+	VMPassword     string
 }
 
 // VMIReadiness bundles phase, IP, and postgres-readiness from a single VMI fetch.
@@ -280,10 +279,10 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 							map[string]interface{}{"name": "pgdata-disk", "disk": map[string]interface{}{"bus": "virtio"}},
 							map[string]interface{}{"name": "cloudinit", "disk": map[string]interface{}{"bus": "virtio"}},
 						},
-						"interfaces": vmInterfaces(p.ConsumerNetwork),
+						"interfaces": vmInterfaces(),
 					},
 				},
-				"networks": vmNetworks(p.Namespace, p.NADName, p.ConsumerNetwork),
+				"networks": vmNetworks(p.Namespace, p.NADName),
 				"volumes": []interface{}{
 					map[string]interface{}{"name": "os-disk", "dataVolume": map[string]interface{}{"name": fmt.Sprintf("pg-%s-os", p.ID)}},
 					map[string]interface{}{"name": "pgdata-disk", "dataVolume": map[string]interface{}{"name": p.DataVolumeRef}},
@@ -472,39 +471,27 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 // Helpers
 // ============================================================
 
-func vmInterfaces(consumerNetwork string) []interface{} {
-	ifaces := []interface{}{
-		map[string]interface{}{"name": "mgmt-net", "masquerade": map[string]interface{}{}},
+// vmInterfaces and vmNetworks describe the VM's single NIC bridged onto the
+// NAD named by spec.networkRef. Everything — client traffic, package install,
+// Prometheus scrape — flows through that one interface, so we don't add a
+// pod-network management NIC.
+func vmInterfaces() []interface{} {
+	return []interface{}{
 		map[string]interface{}{"name": "data-net", "bridge": map[string]interface{}{}},
 	}
-	if consumerNetwork != "" {
-		ifaces = append(ifaces, map[string]interface{}{"name": "consumer-net", "bridge": map[string]interface{}{}})
-	}
-	return ifaces
 }
 
-func vmNetworks(namespace, nadName, consumerNetwork string) []interface{} {
+func vmNetworks(namespace, nadName string) []interface{} {
 	networkName := nadName
 	if !strings.Contains(nadName, "/") {
 		networkName = fmt.Sprintf("%s/%s", namespace, nadName)
 	}
-	nets := []interface{}{
-		map[string]interface{}{
-			"name": "mgmt-net",
-			"pod":  map[string]interface{}{},
-		},
+	return []interface{}{
 		map[string]interface{}{
 			"name":   "data-net",
 			"multus": map[string]interface{}{"networkName": networkName},
 		},
 	}
-	if consumerNetwork != "" {
-		nets = append(nets, map[string]interface{}{
-			"name":   "consumer-net",
-			"multus": map[string]interface{}{"networkName": consumerNetwork},
-		})
-	}
-	return nets
 }
 
 func newUnstructured(apiVersion, kind, name, namespace string) *unstructured.Unstructured {
