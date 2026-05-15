@@ -28,6 +28,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/dynamic"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -39,6 +40,7 @@ import (
 	dbaasv1alpha1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/controller"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/gateway"
+	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/harvester"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -62,6 +64,7 @@ func main() {
 	var enableLeaderElection bool
 	var probeAddr string
 	var gatewayAddr string
+	var grafanaURL string
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
@@ -70,6 +73,8 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&gatewayAddr, "gateway-address", ":8080",
 		"The address the DBInstance REST API gateway binds to.")
+	flag.StringVar(&grafanaURL, "grafana-url", "https://grafana.monitoring.svc",
+		"Base URL of the cluster Grafana instance, used to render per-DBInstance dashboard links.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -159,7 +164,19 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+
+	// Dynamic client for Harvester resources (KubeVirt, CDI, Kube-OVN, ...).
+	// The reconciler uses unstructured objects so it doesn't depend on the
+	// Harvester/KubeVirt typed schemas being imported.
+	dynClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "Failed to create dynamic client")
+		os.Exit(1)
+	}
+	hvClient := harvester.NewClient(dynClient, grafanaURL)
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -184,8 +201,8 @@ func main() {
 	}
 
 	if err := (&controller.DBInstanceReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Harvester: hvClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "dbinstance")
 		os.Exit(1)

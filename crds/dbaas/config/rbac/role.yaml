@@ -5,6 +5,29 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+- apiGroups:
+  - cdi.kubevirt.io
+  resources:
+  - datavolumes
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
   - dbaas.opencloud.wso2.com
   resources:
   - dbinstances
@@ -30,3 +53,57 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - harvesterhci.io
+  resources:
+  - virtualmachineimages
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - k8s.cni.cncf.io
+  resources:
+  - network-attachment-definitions
+  verbs:
+  - create
+  - delete
+- apiGroups:
+  - kubeovn.io
+  resources:
+  - subnets
+  - vpcs
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
+  - kubeovn.io
+  resources:
+  - vpc-peerings
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachineinstances
+  verbs:
+  - get
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachines
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - servicemonitors
+  verbs:
+  - create
+  - delete
