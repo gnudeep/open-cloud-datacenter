@@ -59,16 +59,6 @@ type DBInstanceSpec struct {
 	// +optional
 	StorageType string `json:"storageType,omitempty"`
 
-	// DBSubnetGroupName is the consumer VLAN CIDR or Kube-OVN subnet for app access.
-	// +optional
-	DBSubnetGroupName string `json:"dbSubnetGroupName,omitempty"`
-
-	// VpcPeering configures Kube-OVN VPC peering between the DBaaS VPC and an
-	// external VPC (e.g. the RKE2 cluster VPC) so application pods can reach the
-	// database without being co-located in the DBaaS namespace.
-	// +optional
-	VpcPeering *VpcPeeringConfig `json:"vpcPeering,omitempty"`
-
 	// BackupRetentionPeriod in days. 0 = disabled. Default 7.
 	// +optional
 	BackupRetentionPeriod int `json:"backupRetentionPeriod,omitempty"`
@@ -99,13 +89,12 @@ type DBInstanceSpec struct {
 	// +optional
 	OSImage string `json:"osImage,omitempty"`
 
-	// NetworkRef is a Harvester NAD reference (namespace/name) for an existing
-	// VLAN network to attach the VM to as its primary NIC. When set, the
-	// controller skips Kube-OVN VPC/Subnet/NAD creation and uses this NAD
-	// directly. Use this on clusters where Kube-OVN VPC is not available.
+	// NetworkRef is a Harvester NAD reference (namespace/name) for the VLAN
+	// network the database VM attaches its data NIC to. The NAD must already
+	// exist on the cluster; the controller does not create networks.
 	// Example: "iaas-net/vm-subnet-001".
-	// +optional
-	NetworkRef string `json:"networkRef,omitempty"`
+	// +required
+	NetworkRef string `json:"networkRef"`
 
 	// ConsumerNetwork is the Harvester NAD reference (namespace/name) for a
 	// consumer VLAN that application workloads use to reach the database
@@ -132,15 +121,6 @@ type DBInstanceSpec struct {
 type SecretKeyRef struct {
 	Name string `json:"name"`
 	Key  string `json:"key"`
-}
-
-// VpcPeeringConfig specifies the remote VPC and subnet to peer with.
-type VpcPeeringConfig struct {
-	// RemoteVpc is the name of the Kube-OVN VPC to peer with (e.g. the RKE2 cluster VPC).
-	RemoteVpc string `json:"remoteVpc"`
-
-	// RemoteSubnet is the Kube-OVN subnet name in the remote VPC.
-	RemoteSubnet string `json:"remoteSubnet"`
 }
 
 // S3BackupConfig describes the pgBackRest S3 target.
@@ -227,10 +207,9 @@ type MasterUserSecretRef struct {
 // live in the DBInstance's own namespace — read it via inst.Namespace, not
 // from this struct.
 type ResourceRefs struct {
-	// +optional
-	VPCName string `json:"vpcName,omitempty"`
-	// +optional
-	SubnetName string `json:"subnetName,omitempty"`
+	// NADName is the Multus NetworkAttachmentDefinition the VM's data NIC
+	// attaches to. The controller does not create the NAD; this just records
+	// the reference from spec.networkRef so callers can see it on the CR.
 	// +optional
 	NADName string `json:"nadName,omitempty"`
 	// +optional
@@ -241,8 +220,6 @@ type ResourceRefs struct {
 	SecretName string `json:"secretName,omitempty"`
 	// +optional
 	ServiceMonitor string `json:"serviceMonitor,omitempty"`
-	// +optional
-	VpcPeeringName string `json:"vpcPeeringName,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -283,7 +260,6 @@ const (
 	PhaseWaitingForCloudInit = "WaitingForCloudInit"
 	PhaseDatabaseReady       = "DatabaseReady"
 	PhaseMonitoringDeployed  = "MonitoringDeployed"
-	PhaseVpcPeeringCreated   = "VpcPeeringCreated"
 	PhaseAvailable           = "Available"
 	PhaseFailed              = "Failed"
 

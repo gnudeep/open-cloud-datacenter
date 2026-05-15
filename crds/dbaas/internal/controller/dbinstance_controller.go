@@ -49,9 +49,6 @@ type DBInstanceReconciler struct {
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;create;update;delete
-// +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;subnets,verbs=get;create;update;delete
-// +kubebuilder:rbac:groups=kubeovn.io,resources=vpc-peerings,verbs=get;create;delete
-// +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=create;delete
 // +kubebuilder:rbac:groups=harvesterhci.io,resources=virtualmachineimages,verbs=get;list
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
@@ -114,8 +111,6 @@ func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	case dbaasv1.PhaseDatabaseReady:
 		return r.phaseMonitoring(ctx, &inst)
 	case dbaasv1.PhaseMonitoringDeployed:
-		return r.phaseVpcPeering(ctx, &inst)
-	case dbaasv1.PhaseVpcPeeringCreated:
 		return r.phaseAvailable(ctx, &inst)
 	case dbaasv1.PhaseAvailable:
 		return r.phaseAvailable(ctx, &inst)
@@ -136,37 +131,22 @@ func (r *DBInstanceReconciler) phaseNetwork(ctx context.Context, inst *dbaasv1.D
 		inst.Status.Phase = dbaasv1.StatusCreating
 	}
 
-	// Skip if already done (either VPC mode or direct NAD mode)
-	if inst.Status.Resources.VPCName != "" || inst.Status.Resources.NADName != "" {
+	// Skip if already done.
+	if inst.Status.Resources.NADName != "" {
 		inst.Status.ProvisioningPhase = dbaasv1.PhaseNetworkProvisioned
 		return r.advance(ctx, inst)
 	}
 
-	// Direct NAD mode: use an existing Harvester VLAN NAD, skip VPC creation.
-	if inst.Spec.NetworkRef != "" {
-		inst.Status.Resources.NADName = inst.Spec.NetworkRef
-		inst.Status.ProvisioningPhase = dbaasv1.PhaseNetworkProvisioned
-		inst.Status.Message = fmt.Sprintf("Using existing network %s", inst.Spec.NetworkRef)
-		return r.advance(ctx, inst)
+	// The controller doesn't create or own networks: spec.networkRef must
+	// point at an existing Multus NAD (typically a Harvester VLAN network).
+	if inst.Spec.NetworkRef == "" {
+		return r.fail(ctx, inst, "NetworkRefMissing",
+			fmt.Errorf("spec.networkRef is required (namespace/nad of an existing Multus NetworkAttachmentDefinition)"))
 	}
 
-	id := inst.Name
-	ns := inst.Namespace
-	consumerVLAN := inst.Spec.DBSubnetGroupName
-	if consumerVLAN == "" {
-		consumerVLAN = "10.50.0.0/24"
-	}
-
-	vpcName, subnetName, nadName, err := r.Harvester.CreateVPCNetwork(ctx, id, ns, consumerVLAN)
-	if err != nil {
-		return r.fail(ctx, inst, "NetworkFailed", err)
-	}
-
-	inst.Status.Resources.VPCName = vpcName
-	inst.Status.Resources.SubnetName = subnetName
-	inst.Status.Resources.NADName = nadName
+	inst.Status.Resources.NADName = inst.Spec.NetworkRef
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseNetworkProvisioned
-	inst.Status.Message = "VPC network provisioned"
+	inst.Status.Message = fmt.Sprintf("Using network %s", inst.Spec.NetworkRef)
 
 	return r.advance(ctx, inst)
 }
@@ -230,7 +210,6 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 		MemoryMB:        classSpec.MemoryMB,
 		OSImage:         osImage,
 		DataVolumeRef:   inst.Status.Resources.DataVolumeName,
-		SubnetName:      inst.Status.Resources.SubnetName,
 		NADName:         inst.Status.Resources.NADName,
 		MasterUser:      masterUser,
 		DBName:          dbName,
@@ -341,36 +320,6 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, r.statusUpdate(ctx, inst)
-}
-
-func (r *DBInstanceReconciler) phaseVpcPeering(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
-	// Skip if already done or not requested
-	if inst.Status.Resources.VpcPeeringName != "" || inst.Spec.VpcPeering == nil {
-		inst.Status.ProvisioningPhase = dbaasv1.PhaseVpcPeeringCreated
-		return r.advance(ctx, inst)
-	}
-
-	peeringName, err := r.Harvester.CreateVpcPeering(
-		ctx,
-		inst.Name,
-		inst.Status.Resources.VPCName,
-		inst.Status.Resources.SubnetName,
-		inst.Spec.VpcPeering.RemoteVpc,
-		inst.Spec.VpcPeering.RemoteSubnet,
-	)
-	if err != nil {
-		// Non-fatal: clusters without the Kube-OVN VpcPeering CRD (the common
-		// case on stock Harvester) shouldn't block the database from going
-		// Available. Log it and advance.
-		log.FromContext(ctx).Error(err, "VPC peering setup failed (non-fatal)")
-		inst.Status.Message = fmt.Sprintf("Available (VPC peering skipped: %v)", err)
-	} else {
-		inst.Status.Resources.VpcPeeringName = peeringName
-		inst.Status.Message = "VPC peering established"
-	}
-
-	inst.Status.ProvisioningPhase = dbaasv1.PhaseVpcPeeringCreated
-	return r.advance(ctx, inst)
 }
 
 // ============================================================

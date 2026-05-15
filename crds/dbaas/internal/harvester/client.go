@@ -15,8 +15,10 @@ limitations under the License.
 */
 
 // Package harvester wraps the Kubernetes dynamic client to drive the Harvester
-// HCI APIs (KubeVirt, CDI, Kube-OVN, Prometheus Operator) that back a
-// DBInstance: networking, storage, the PostgreSQL VM, monitoring, and teardown.
+// HCI APIs (KubeVirt, CDI, Prometheus Operator) that back a DBInstance: the
+// PostgreSQL VM, storage, monitoring, and teardown. Networking is provided by
+// an existing Multus NetworkAttachmentDefinition (spec.networkRef); the
+// controller does not create or own NADs, VPCs, or subnets.
 package harvester
 
 import (
@@ -24,7 +26,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
@@ -49,15 +50,6 @@ var (
 	dvGVR = schema.GroupVersionResource{
 		Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "datavolumes",
 	}
-	vpcGVR = schema.GroupVersionResource{
-		Group: "kubeovn.io", Version: "v1", Resource: "vpcs",
-	}
-	subnetGVR = schema.GroupVersionResource{
-		Group: "kubeovn.io", Version: "v1", Resource: "subnets",
-	}
-	nadGVR = schema.GroupVersionResource{
-		Group: "k8s.cni.cncf.io", Version: "v1", Resource: "network-attachment-definitions",
-	}
 	secretGVR = schema.GroupVersionResource{
 		Group: "", Version: "v1", Resource: "secrets",
 	}
@@ -66,9 +58,6 @@ var (
 	}
 	smGVR = schema.GroupVersionResource{
 		Group: "monitoring.coreos.com", Version: "v1", Resource: "servicemonitors",
-	}
-	vpcPeeringGVR = schema.GroupVersionResource{
-		Group: "kubeovn.io", Version: "v1", Resource: "vpc-peerings",
 	}
 	vmImageGVR = schema.GroupVersionResource{
 		Group: "harvesterhci.io", Version: "v1beta1", Resource: "virtualmachineimages",
@@ -95,7 +84,6 @@ type VMCreateParams struct {
 	MemoryMB        int
 	OSImage         string
 	DataVolumeRef   string
-	SubnetName      string
 	NADName         string
 	MasterUser      string
 	DBName          string
@@ -113,74 +101,6 @@ type VMIReadiness struct {
 	Running bool
 	IP      string
 	Ready   bool // Running AND uptime > 3 min
-}
-
-// ============================================================
-// Network: Kube-OVN VPC + Subnet + NAD
-// ============================================================
-
-func (c *Client) CreateVPCNetwork(ctx context.Context, id, ns, consumerVLAN string) (vpcName, subnetName, nadName string, err error) {
-	vpcName = fmt.Sprintf("dbaas-%s-vpc", id)
-	subnetName = fmt.Sprintf("dbaas-%s-subnet", id)
-	nadName = fmt.Sprintf("dbaas-%s-nad", id)
-	cidr, gw := subnetCIDRForID(id)
-
-	// 1. Create VPC
-	vpc := newUnstructured("kubeovn.io/v1", "Vpc", vpcName, "")
-	_ = unstructured.SetNestedSlice(vpc.Object, []interface{}{ns}, "spec", "namespaces")
-	created, e := c.Dynamic.Resource(vpcGVR).Create(ctx, vpc, metav1.CreateOptions{})
-	if e != nil {
-		if !apierrors.IsAlreadyExists(e) {
-			err = e
-			return
-		}
-		created, _ = c.Dynamic.Resource(vpcGVR).Get(ctx, vpcName, metav1.GetOptions{})
-	}
-
-	// 2. Create NAD (must exist before Subnet — Harvester subnet webhook validates the NAD by provider).
-	provider := fmt.Sprintf("%s.%s.ovn", nadName, ns)
-	nad := newUnstructured("k8s.cni.cncf.io/v1", "NetworkAttachmentDefinition", nadName, ns)
-	nad.SetLabels(map[string]string{
-		"network.harvesterhci.io/type":           "OverlayNetwork",
-		"network.harvesterhci.io/clusternetwork": "mgmt",
-		"network.harvesterhci.io/ready":          "true",
-	})
-	config := fmt.Sprintf(`{"cniVersion":"0.3.1","type":"kube-ovn","server_socket":"/run/openvswitch/kube-ovn-daemon.sock","provider":"%s"}`, provider)
-	_ = unstructured.SetNestedField(nad.Object, config, "spec", "config")
-	if _, e := c.Dynamic.Resource(nadGVR).Namespace(ns).Create(ctx, nad, metav1.CreateOptions{}); e != nil {
-		if err = ignoreAlreadyExists(e); err != nil {
-			return
-		}
-	}
-
-	// 3. Create Subnet (provider links it to the NAD; Harvester webhook requires this).
-	subnet := newUnstructured("kubeovn.io/v1", "Subnet", subnetName, "")
-	_ = unstructured.SetNestedField(subnet.Object, vpcName, "spec", "vpc")
-	_ = unstructured.SetNestedField(subnet.Object, provider, "spec", "provider")
-	_ = unstructured.SetNestedField(subnet.Object, cidr, "spec", "cidrBlock")
-	_ = unstructured.SetNestedField(subnet.Object, gw, "spec", "gateway")
-	_ = unstructured.SetNestedField(subnet.Object, "IPv4", "spec", "protocol")
-	_ = unstructured.SetNestedSlice(subnet.Object, []interface{}{ns}, "spec", "namespaces")
-	_ = unstructured.SetNestedField(subnet.Object, true, "spec", "private")
-	_ = unstructured.SetNestedField(subnet.Object, true, "spec", "enableDHCP")
-	_ = unstructured.SetNestedSlice(subnet.Object, []interface{}{consumerVLAN}, "spec", "allowSubnets")
-	if _, e := c.Dynamic.Resource(subnetGVR).Create(ctx, subnet, metav1.CreateOptions{}); e != nil {
-		if err = ignoreAlreadyExists(e); err != nil {
-			return
-		}
-	}
-
-	// 4. Add static route for consumer VLAN access
-	if created != nil {
-		routes, _, _ := unstructured.NestedSlice(created.Object, "spec", "staticRoutes")
-		routes = append(routes, map[string]interface{}{
-			"cidr": consumerVLAN, "nextHopIP": "autodetect", "policy": "policyDst",
-		})
-		_ = unstructured.SetNestedSlice(created.Object, routes, "spec", "staticRoutes")
-		_, _ = c.Dynamic.Resource(vpcGVR).Update(ctx, created, metav1.UpdateOptions{})
-	}
-
-	return
 }
 
 // ============================================================
@@ -349,9 +269,6 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 		"template": map[string]interface{}{
 			"metadata": map[string]interface{}{
 				"labels": map[string]interface{}{dbaasv1.LabelInstance: p.ID},
-				"annotations": map[string]interface{}{
-					"ovn.kubernetes.io/logical_switch": p.SubnetName,
-				},
 			},
 			"spec": map[string]interface{}{
 				"domain": map[string]interface{}{
@@ -397,9 +314,9 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 
 	var ip string
 	interfaces, _, _ := unstructured.NestedSlice(vmi.Object, "status", "interfaces")
-	// Prefer vpc-net (Multus bridge) over mgmt-net (pod masquerade).
+	// Prefer data-net (Multus bridge) over mgmt-net (pod masquerade).
 	// KubeVirt lists masquerade first, so we scan all interfaces and pick
-	// vpc-net explicitly; fall back to the first address if not found.
+	// data-net explicitly; fall back to the first address if not found.
 	var fallbackIP string
 	for _, iface := range interfaces {
 		ifMap, ok := iface.(map[string]interface{})
@@ -411,7 +328,7 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 			continue
 		}
 		name, _ := ifMap["name"].(string)
-		if name == "vpc-net" {
+		if name == "data-net" {
 			ip = addr
 			break
 		}
@@ -513,53 +430,24 @@ func (c *Client) DeployMonitoring(ctx context.Context, id, ns, vmAddr string, pg
 }
 
 // ============================================================
-// VPC Peering: Kube-OVN VpcPeering between DBaaS VPC and external VPC
-// ============================================================
-
-// CreateVpcPeering creates a Kube-OVN VpcPeering resource that enables
-// bidirectional routing between the DBaaS VPC and a remote VPC (e.g.
-// an RKE2 cluster VPC).
-func (c *Client) CreateVpcPeering(ctx context.Context, id, dbVpcName, dbSubnetName, remoteVpc, remoteSubnet string) (string, error) {
-	name := fmt.Sprintf("dbaas-%s-peering", id)
-	peering := newUnstructured("kubeovn.io/v1", "VpcPeering", name, "")
-	_ = unstructured.SetNestedField(peering.Object, dbVpcName, "spec", "localVpc")
-	_ = unstructured.SetNestedField(peering.Object, remoteVpc, "spec", "remoteVpc")
-	_ = unstructured.SetNestedSlice(peering.Object, []interface{}{dbSubnetName}, "spec", "localSubnets")
-	_ = unstructured.SetNestedSlice(peering.Object, []interface{}{remoteSubnet}, "spec", "remoteSubnets")
-	if _, err := c.Dynamic.Resource(vpcPeeringGVR).Create(ctx, peering, metav1.CreateOptions{}); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return name, nil
-		}
-		return "", err
-	}
-	return name, nil
-}
-
-// ============================================================
 // Teardown
 // ============================================================
 
+// TeardownAll deletes every Harvester resource the controller created for this
+// DBInstance, in parallel. The NetworkAttachmentDefinition is always assumed
+// to be owned by the cluster operator (referenced via spec.networkRef) and is
+// not deleted here.
 func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.ResourceRefs) {
 	type deleteTask struct {
 		gvr       schema.GroupVersionResource
 		namespace string
 		name      string
 	}
-	// Only delete the NAD if we created it (VPC mode). In direct NAD mode
-	// (networkRef), VPCName is empty and the NAD is owned by the cluster operator.
-	ownedNAD := ""
-	if refs.VPCName != "" {
-		ownedNAD = refs.NADName
-	}
 	tasks := []deleteTask{
 		{smGVR, ns, refs.ServiceMonitor},
 		{vmGVR, ns, refs.VMName},
 		{dvGVR, ns, refs.DataVolumeName},
 		{secretGVR, ns, refs.SecretName},
-		{nadGVR, ns, ownedNAD},
-		{subnetGVR, "", refs.SubnetName},
-		{vpcPeeringGVR, "", refs.VpcPeeringName},
-		{vpcGVR, "", refs.VPCName},
 	}
 
 	var wg sync.WaitGroup
@@ -587,7 +475,7 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 func vmInterfaces(consumerNetwork string) []interface{} {
 	ifaces := []interface{}{
 		map[string]interface{}{"name": "mgmt-net", "masquerade": map[string]interface{}{}},
-		map[string]interface{}{"name": "vpc-net", "bridge": map[string]interface{}{}},
+		map[string]interface{}{"name": "data-net", "bridge": map[string]interface{}{}},
 	}
 	if consumerNetwork != "" {
 		ifaces = append(ifaces, map[string]interface{}{"name": "consumer-net", "bridge": map[string]interface{}{}})
@@ -606,7 +494,7 @@ func vmNetworks(namespace, nadName, consumerNetwork string) []interface{} {
 			"pod":  map[string]interface{}{},
 		},
 		map[string]interface{}{
-			"name":   "vpc-net",
+			"name":   "data-net",
 			"multus": map[string]interface{}{"networkName": networkName},
 		},
 	}
@@ -639,19 +527,6 @@ func ignoreAlreadyExists(err error) error {
 		return nil
 	}
 	return err
-}
-
-// subnetCIDRForID uses FNV-32a to derive a /24 subnet CIDR from an instance name.
-// The scheme 10.A.B.0/24 (A ∈ [100,227], B ∈ [0,255]) gives 32,768 possible subnets,
-// dramatically reducing hash collisions compared to a single-byte hash.
-func subnetCIDRForID(id string) (cidr, gw string) {
-	h := fnv.New32a()
-	h.Write([]byte(id))
-	v := h.Sum32()
-	a := 100 + int((v>>8)&0x7F) // 100–227
-	b := int(v & 0xFF)          // 0–255
-	return fmt.Sprintf("10.%d.%d.0/24", a, b),
-		fmt.Sprintf("10.%d.%d.1", a, b)
 }
 
 func randomString(n int) string {

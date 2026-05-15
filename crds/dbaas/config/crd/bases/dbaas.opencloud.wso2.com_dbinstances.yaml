@@ -84,10 +84,6 @@ spec:
                 description: DBParameterGroupRef references a DBParameterGroup by
                   name.
                 type: string
-              dbSubnetGroupName:
-                description: DBSubnetGroupName is the consumer VLAN CIDR or Kube-OVN
-                  subnet for app access.
-                type: string
               deletionProtection:
                 description: DeletionProtection prevents accidental deletion.
                 type: boolean
@@ -120,10 +116,9 @@ spec:
                 type: boolean
               networkRef:
                 description: |-
-                  NetworkRef is a Harvester NAD reference (namespace/name) for an existing
-                  VLAN network to attach the VM to as its primary NIC. When set, the
-                  controller skips Kube-OVN VPC/Subnet/NAD creation and uses this NAD
-                  directly. Use this on clusters where Kube-OVN VPC is not available.
+                  NetworkRef is a Harvester NAD reference (namespace/name) for the VLAN
+                  network the database VM attaches its data NIC to. The NAD must already
+                  exist on the cluster; the controller does not create networks.
                   Example: "iaas-net/vm-subnet-001".
                 type: string
               osImage:
@@ -173,27 +168,10 @@ spec:
                   VMPassword sets the default console/SSH password for the VM user (ubuntu).
                   For development and debugging only — leave empty in production.
                 type: string
-              vpcPeering:
-                description: |-
-                  VpcPeering configures Kube-OVN VPC peering between the DBaaS VPC and an
-                  external VPC (e.g. the RKE2 cluster VPC) so application pods can reach the
-                  database without being co-located in the DBaaS namespace.
-                properties:
-                  remoteSubnet:
-                    description: RemoteSubnet is the Kube-OVN subnet name in the remote
-                      VPC.
-                    type: string
-                  remoteVpc:
-                    description: RemoteVpc is the name of the Kube-OVN VPC to peer
-                      with (e.g. the RKE2 cluster VPC).
-                    type: string
-                required:
-                - remoteSubnet
-                - remoteVpc
-                type: object
             required:
             - allocatedStorage
             - dbInstanceClass
+            - networkRef
             type: object
           status:
             description: DBInstanceStatus defines the observed state of a DBInstance.
@@ -320,18 +298,16 @@ spec:
                   dataVolumeName:
                     type: string
                   nadName:
+                    description: |-
+                      NADName is the Multus NetworkAttachmentDefinition the VM's data NIC
+                      attaches to. The controller does not create the NAD; this just records
+                      the reference from spec.networkRef so callers can see it on the CR.
                     type: string
                   secretName:
                     type: string
                   serviceMonitor:
                     type: string
-                  subnetName:
-                    type: string
                   vmName:
-                    type: string
-                  vpcName:
-                    type: string
-                  vpcPeeringName:
                     type: string
                 type: object
             type: object

@@ -12,7 +12,8 @@ spec:
   dbName: myapp
   masterUsername: dbadmin
   manageMasterUserPassword: true
-  dbSubnetGroupName: "10.50.0.0/24"
+  # networkRef points at an existing Harvester Multus NAD (namespace/name).
+  networkRef: default/vm-net-100
   backupRetentionPeriod: 7
   deletionProtection: true
   running: true

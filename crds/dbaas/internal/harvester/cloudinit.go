@@ -77,7 +77,7 @@ write_files:
       MAX_CONNECTIONS=%d
       LUKS_KEY=%s
       %s
-  - path: /etc/netplan/60-vpc-net.yaml
+  - path: /etc/netplan/60-data-net.yaml
     permissions: "0600"
     content: |
       network:
