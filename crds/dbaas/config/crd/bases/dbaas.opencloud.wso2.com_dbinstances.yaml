@@ -150,6 +150,37 @@ spec:
                 - endpoint
                 - secretRef
                 type: object
+              staticNetwork:
+                description: |-
+                  StaticNetwork, when set, configures the VM's data NIC with a static
+                  IPv4 address, gateway, and DNS servers instead of running DHCP. Use
+                  this on VLANs that don't have a DHCP server reachable from the VM.
+                  When nil, cloud-init runs DHCP on the data NIC (the default).
+                properties:
+                  address:
+                    description: Address is the IPv4 address with CIDR prefix, e.g.
+                      "192.168.40.50/24".
+                    type: string
+                  gateway:
+                    description: Gateway is the IPv4 default gateway, e.g. "192.168.40.1".
+                    type: string
+                  nameservers:
+                    description: |-
+                      Nameservers are the DNS server IPs the VM should use. Supply at
+                      least one — cloud-init will fail to resolve apt mirrors without DNS.
+                    items:
+                      type: string
+                    type: array
+                  searchDomains:
+                    description: SearchDomains are DNS search-domain suffixes. Optional.
+                    items:
+                      type: string
+                    type: array
+                required:
+                - address
+                - gateway
+                - nameservers
+                type: object
               storageType:
                 description: StorageType maps to a Longhorn StorageClass. Default
                   "longhorn".

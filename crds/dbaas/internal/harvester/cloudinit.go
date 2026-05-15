@@ -19,7 +19,47 @@ package harvester
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 )
+
+// dataNetNetplan returns the YAML body (already indented to the surrounding
+// `content: |` block) configuring the VM's single data NIC. When
+// StaticNetwork is nil the NIC runs DHCP; when it's set we emit a static
+// configuration so VLANs without a DHCP server still come up.
+func dataNetNetplan(p VMCreateParams) string {
+	if p.StaticNetwork == nil {
+		return `      network:
+        version: 2
+        ethernets:
+          data:
+            match:
+              driver: virtio_net
+            dhcp4: true`
+	}
+	ns := p.StaticNetwork
+	search := ""
+	if len(ns.SearchDomains) > 0 {
+		search = fmt.Sprintf("\n              search: [%s]", strings.Join(ns.SearchDomains, ", "))
+	}
+	return fmt.Sprintf(`      network:
+        version: 2
+        ethernets:
+          data:
+            match:
+              driver: virtio_net
+            dhcp4: false
+            addresses: [%s]
+            routes:
+              - to: default
+                via: %s
+            nameservers:
+              addresses: [%s]%s`,
+		ns.Address,
+		ns.Gateway,
+		strings.Join(ns.Nameservers, ", "),
+		search,
+	)
+}
 
 func buildCloudInit(p VMCreateParams, adminPw, replPw, exporterPw, luksKey string, tls *TLSBundle) string {
 	backupConfig := "# backups disabled"
@@ -70,13 +110,7 @@ write_files:
   - path: /etc/netplan/60-data-net.yaml
     permissions: "0600"
     content: |
-      network:
-        version: 2
-        ethernets:
-          data:
-            match:
-              driver: virtio_net
-            dhcp4: true
+%s
   - path: /etc/ssl/certs/pg-ca.crt
     encoding: b64
     permissions: "0644"
@@ -149,6 +183,7 @@ final_message: "DBaaS bootstrap complete for %s"
 		p.MaxConnections,
 		luksKey,
 		backupConfig,
+		dataNetNetplan(p),
 		caCertB64,
 		serverCertB64,
 		serverKeyB64,

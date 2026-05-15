@@ -93,6 +93,10 @@ type VMCreateParams struct {
 	BackupWindow   string
 	S3Config       *dbaasv1.S3BackupConfig
 	VMPassword     string
+	// StaticNetwork, when non-nil, makes the cloud-init netplan use a
+	// static IPv4 config instead of DHCP. Used on VLANs without a DHCP
+	// server.
+	StaticNetwork *dbaasv1.NetworkConfig
 }
 
 // VMIReadiness bundles phase, IP, and postgres-readiness from a single VMI fetch.

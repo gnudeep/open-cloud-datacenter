@@ -99,6 +99,13 @@ type DBInstanceSpec struct {
 	// +required
 	NetworkRef string `json:"networkRef"`
 
+	// StaticNetwork, when set, configures the VM's data NIC with a static
+	// IPv4 address, gateway, and DNS servers instead of running DHCP. Use
+	// this on VLANs that don't have a DHCP server reachable from the VM.
+	// When nil, cloud-init runs DHCP on the data NIC (the default).
+	// +optional
+	StaticNetwork *NetworkConfig `json:"staticNetwork,omitempty"`
+
 	// VMPassword sets the default console/SSH password for the VM user (ubuntu).
 	// For development and debugging only — leave empty in production.
 	// +optional
@@ -117,6 +124,28 @@ type DBInstanceSpec struct {
 type SecretKeyRef struct {
 	Name string `json:"name"`
 	Key  string `json:"key"`
+}
+
+// NetworkConfig is a static IPv4 configuration for the database VM's data
+// NIC. When set on DBInstanceSpec.StaticNetwork, these values are written
+// into cloud-init's netplan in place of `dhcp4: true`.
+type NetworkConfig struct {
+	// Address is the IPv4 address with CIDR prefix, e.g. "192.168.40.50/24".
+	// +required
+	Address string `json:"address"`
+
+	// Gateway is the IPv4 default gateway, e.g. "192.168.40.1".
+	// +required
+	Gateway string `json:"gateway"`
+
+	// Nameservers are the DNS server IPs the VM should use. Supply at
+	// least one — cloud-init will fail to resolve apt mirrors without DNS.
+	// +required
+	Nameservers []string `json:"nameservers"`
+
+	// SearchDomains are DNS search-domain suffixes. Optional.
+	// +optional
+	SearchDomains []string `json:"searchDomains,omitempty"`
 }
 
 // S3BackupConfig describes the pgBackRest S3 target.
