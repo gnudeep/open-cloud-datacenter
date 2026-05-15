@@ -168,8 +168,18 @@ writes the CR and returns `202 Accepted`; the reconciler does the work.
 | `POST` | `/dbinstances/{name}/stop` | **stop db** — sets `spec.running = false`. |
 
 The default namespace is `default`, overridable with the `DBAAS_DEFAULT_NAMESPACE`
-environment variable. The gateway has no authentication of its own; place it
-behind an ingress / API gateway that enforces auth before exposing it.
+environment variable.
+
+**Authentication.** Every request except `/healthz` must carry
+`Authorization: Bearer <token>` where `<token>` is a Kubernetes credential
+the cluster's API server accepts (a ServiceAccount token, an OIDC ID token,
+etc.). The gateway clones its `rest.Config`, replaces the bearer token with
+the caller's, builds a per-request controller-runtime client, and uses it
+for the K8s API call — so authentication, RBAC, and audit are enforced by
+the K8s API server on the caller's identity, not on the manager's
+ServiceAccount. RBAC denials from the API server propagate back as `403
+Forbidden`; unknown or expired tokens become `401 Unauthorized`. The
+manager never elevates beyond what the caller is RBAC-authorized to do.
 
 ## Reconciler — phase state machine
 
@@ -347,8 +357,10 @@ you don't go looking for the code:
   them; this module has only `DBInstance`).
 - **No `multiAZ` / Patroni HA** — the field exists in the spec but the
   reconciler ignores it.
-- **No auth on the REST gateway.** OIDC / API key / mTLS is expected to be
-  provided by a fronting ingress.
+- **No TLS termination inside the gateway.** Authentication is enforced
+  via K8s API server delegation (bearer-token forwarding), but the HTTP
+  endpoint itself is plain. Front it with an ingress that terminates TLS
+  for production exposure.
 - **No automated TLS rotation.** Per-instance CAs are valid 10 years and
   not currently re-issued.
 

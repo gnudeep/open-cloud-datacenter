@@ -19,7 +19,6 @@ package main
 import (
 	"crypto/tls"
 	"flag"
-	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -220,15 +219,15 @@ func main() {
 
 	ctx := ctrl.SetupSignalHandler()
 
-	// Start the DBInstance REST API gateway alongside the controller. It waits
-	// for the manager's cache to sync before serving so reads are consistent.
+	// Start the DBInstance REST API gateway alongside the controller. Every
+	// HTTP request must carry an Authorization: Bearer <token>; the gateway
+	// builds a per-request controller-runtime client signed with that token
+	// so the K8s API server enforces authn, RBAC, and audit on the caller
+	// (not on the controller's ServiceAccount). The gateway does not use
+	// mgr.GetClient() and therefore doesn't need to wait for the cache.
 	go func() {
-		if !mgr.GetCache().WaitForCacheSync(ctx) {
-			setupLog.Error(fmt.Errorf("cache sync failed"), "Gateway startup aborted")
-			return
-		}
 		setupLog.Info("Starting REST API gateway", "address", gatewayAddr)
-		if err := gateway.RunGateway(gatewayAddr, mgr.GetClient()); err != nil {
+		if err := gateway.RunGateway(gatewayAddr, restConfig, mgr.GetScheme(), mgr.GetRESTMapper()); err != nil {
 			setupLog.Error(err, "Gateway exited with error")
 		}
 	}()

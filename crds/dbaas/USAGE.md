@@ -237,9 +237,43 @@ The gateway reads/writes `DBInstance`s in the namespace named by the
 operate on `tenant-acme`, edit the manager Deployment and set
 `DBAAS_DEFAULT_NAMESPACE=tenant-acme`.
 
+**Authentication.** Every request except `/healthz` must include an
+`Authorization: Bearer <token>` header. The gateway forwards the call to
+the K8s API server using *that* token, so authn / RBAC / audit happen on
+your identity — not the controller's. Easiest way to get a token:
+
+```sh
+# Option A: short-lived token for an existing ServiceAccount the caller controls.
+TOKEN=$(kubectl create token <serviceaccount> -n <ns> --duration=1h)
+
+# Option B: your own user token (if the cluster has OIDC; depends on setup).
+# Option C: read it from your kubeconfig (works for token-based auth).
+TOKEN=$(kubectl config view --raw -o jsonpath='{.users[0].user.token}')
+
+AUTH="Authorization: Bearer $TOKEN"
+```
+
+That ServiceAccount must have RBAC for `dbinstances` in the gateway's
+namespace; otherwise the K8s API server returns `403 Forbidden` and the
+gateway propagates it. A minimal Role for a tenant operator:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dbaas-operator
+  namespace: tenant-acme
+rules:
+- apiGroups: ["dbaas.opencloud.wso2.com"]
+  resources: ["dbinstances"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+The curl examples below assume `$AUTH` is set as above.
+
 ```sh
 # create
-curl -sS -X POST "$GATEWAY/dbinstances" \
+curl -sS -H "$AUTH" -X POST "$GATEWAY/dbinstances" \
   -H "Content-Type: application/json" \
   -d '{
     "metadata": {"name": "orders-prod"},
@@ -255,10 +289,10 @@ curl -sS -X POST "$GATEWAY/dbinstances" \
   }' | jq .
 
 # describe
-curl -sS "$GATEWAY/dbinstances/orders-prod" | jq '.status'
+curl -sS -H "$AUTH" "$GATEWAY/dbinstances/orders-prod" | jq '.status'
 
 # modify (resize + new backup window)
-curl -sS -X PATCH "$GATEWAY/dbinstances/orders-prod" \
+curl -sS -H "$AUTH" -X PATCH "$GATEWAY/dbinstances/orders-prod" \
   -H "Content-Type: application/json" \
   -d '{
     "dbInstanceClass": "db.m5.large",
@@ -267,15 +301,25 @@ curl -sS -X PATCH "$GATEWAY/dbinstances/orders-prod" \
   }' | jq '.status.phase'
 
 # stop / start
-curl -sS -X POST "$GATEWAY/dbinstances/orders-prod/stop"  | jq '.status.phase'
-curl -sS -X POST "$GATEWAY/dbinstances/orders-prod/start" | jq '.status.phase'
+curl -sS -H "$AUTH" -X POST "$GATEWAY/dbinstances/orders-prod/stop"  | jq '.status.phase'
+curl -sS -H "$AUTH" -X POST "$GATEWAY/dbinstances/orders-prod/start" | jq '.status.phase'
 
 # delete (after disabling protection via PATCH first)
-curl -sS -X PATCH "$GATEWAY/dbinstances/orders-prod" \
+curl -sS -H "$AUTH" -X PATCH "$GATEWAY/dbinstances/orders-prod" \
   -H "Content-Type: application/json" \
   -d '{"deletionProtection": false}'
-curl -sS -X DELETE "$GATEWAY/dbinstances/orders-prod" | jq .
+curl -sS -H "$AUTH" -X DELETE "$GATEWAY/dbinstances/orders-prod" | jq .
+
+# /healthz is unauthenticated:
+curl -sS "$GATEWAY/healthz"
 ```
+
+Responses you may see from the auth layer:
+
+| Status | Meaning |
+| --- | --- |
+| `401 Unauthorized` | Missing or unparseable `Authorization: Bearer …` header, or the K8s API server didn't recognize the token. |
+| `403 Forbidden` | Token is valid but the identity lacks RBAC for that operation/namespace. |
 
 ## Troubleshooting
 

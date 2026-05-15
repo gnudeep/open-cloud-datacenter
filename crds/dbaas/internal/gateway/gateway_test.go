@@ -36,8 +36,15 @@ import (
 	dbaasv1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
 )
 
+// testToken is a placeholder bearer credential. The test clientFactory
+// ignores it; we only need it to clear the auth gate.
+const testToken = "test-bearer-token"
+
 // newHandler builds a gateway handler backed by a fake client seeded with objs,
-// and returns both so tests can assert on the resulting cluster state.
+// and returns both so tests can assert on the resulting cluster state. The
+// per-request clientFactory ignores the token and always returns the same
+// fake client; tests that exercise the auth gate hit it directly via the
+// "missing Authorization header" path.
 func newHandler(t *testing.T, objs ...client.Object) (http.Handler, client.Client) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -45,7 +52,10 @@ func newHandler(t *testing.T, objs ...client.Object) (http.Handler, client.Clien
 		t.Fatalf("add dbaas scheme: %v", err)
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
-	return NewHandler(c), c
+	srv := &Server{
+		clientFor: func(token string) (client.Client, error) { return c, nil },
+	}
+	return srv.routes(), c
 }
 
 // sampleInstance returns a DBInstance in the gateway's default namespace.
@@ -62,9 +72,16 @@ func sampleInstance(name string) *dbaasv1.DBInstance {
 	}
 }
 
-// do issues an HTTP request against h. A string body is sent verbatim (handy
-// for malformed-JSON cases); any other body is JSON-encoded.
+// do issues an HTTP request against h with a valid bearer token. A string
+// body is sent verbatim (handy for malformed-JSON cases); any other body is
+// JSON-encoded.
 func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+	return doWithAuth(t, h, method, path, body, "Bearer "+testToken)
+}
+
+// doWithAuth is like do but takes an explicit Authorization header value
+// (use "" to omit the header entirely). For testing the auth gate.
+func doWithAuth(t *testing.T, h http.Handler, method, path string, body any, authHeader string) *httptest.ResponseRecorder {
 	t.Helper()
 	var r io.Reader
 	switch b := body.(type) {
@@ -80,6 +97,9 @@ func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.R
 		r = bytes.NewReader(raw)
 	}
 	req := httptest.NewRequest(method, path, r)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -98,11 +118,38 @@ func getInstance(t *testing.T, c client.Client, name string) *dbaasv1.DBInstance
 func TestHealthz(t *testing.T) {
 	h, _ := newHandler(t)
 
-	if rec := do(t, h, http.MethodGet, "/healthz", nil); rec.Code != http.StatusOK {
-		t.Fatalf("GET /healthz: got %d, want 200", rec.Code)
+	// Healthz is deliberately unauthenticated.
+	if rec := doWithAuth(t, h, http.MethodGet, "/healthz", nil, ""); rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz without auth: got %d, want 200", rec.Code)
 	}
 	if rec := do(t, h, http.MethodDelete, "/healthz", nil); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("DELETE /healthz: got %d, want 405", rec.Code)
+	}
+}
+
+func TestAuthRequired(t *testing.T) {
+	h, _ := newHandler(t, sampleInstance("orders"))
+
+	cases := []struct {
+		name, method, path, header string
+	}{
+		{"list no header", http.MethodGet, "/dbinstances", ""},
+		{"create no header", http.MethodPost, "/dbinstances", ""},
+		{"get no header", http.MethodGet, "/dbinstances/orders", ""},
+		{"patch no header", http.MethodPatch, "/dbinstances/orders", ""},
+		{"delete no header", http.MethodDelete, "/dbinstances/orders", ""},
+		{"start no header", http.MethodPost, "/dbinstances/orders/start", ""},
+		{"stop no header", http.MethodPost, "/dbinstances/orders/stop", ""},
+		{"wrong scheme", http.MethodGet, "/dbinstances", "Basic Zm9vOmJhcg=="},
+		{"empty bearer", http.MethodGet, "/dbinstances", "Bearer "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doWithAuth(t, h, tc.method, tc.path, nil, tc.header)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("got %d, want 401 (body: %s)", rec.Code, rec.Body)
+			}
+		})
 	}
 }
 
