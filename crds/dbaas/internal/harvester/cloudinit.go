@@ -92,14 +92,14 @@ ssh_pwauth: true
 	serverCertB64 := base64.StdEncoding.EncodeToString([]byte(tls.ServerCertPEM))
 	serverKeyB64 := base64.StdEncoding.EncodeToString([]byte(tls.ServerKeyPEM))
 
+	// Install everything from bootstrap.sh's apt calls rather than relying
+	// on cloud-init's `packages:` module. Minimal cloud images (Ubuntu's
+	// `ubuntu-24.04-minimal-cloudimg` is one) strip
+	// `package_update_upgrade_install` from their cloud-init module list,
+	// so a top-level `packages:` directive is silently ignored. Doing the
+	// install from runcmd works on every flavour.
 	return fmt.Sprintf(`#cloud-config
-%spackage_update: true
-packages:
-  - postgresql
-  - postgresql-contrib
-  - jq
-  - qemu-guest-agent
-write_files:
+%swrite_files:
   - path: /etc/dbaas/bootstrap.env
     permissions: "0600"
     content: |
@@ -131,6 +131,14 @@ write_files:
       #!/bin/bash
       set -euo pipefail
       source /etc/dbaas/bootstrap.env
+
+      # 1. Install PostgreSQL + helpers. Done here, not via cloud-init's
+      #    "packages:" directive, so it works on minimal cloud images
+      #    that don't load the package module.
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y postgresql postgresql-contrib jq qemu-guest-agent
+      systemctl enable --now qemu-guest-agent
 
       PG_VER=$(pg_lsclusters -h | awk '{print $1}' | head -1)
       PG_CONF="/etc/postgresql/${PG_VER}/main"
@@ -167,9 +175,8 @@ write_files:
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
       EOSQL
 runcmd:
-  - systemctl enable --now qemu-guest-agent
   - mkdir -p /var/lib/dbaas
-  - chown postgres:postgres /var/lib/dbaas
+  - chown root:root /var/lib/dbaas
   - /etc/dbaas/bootstrap.sh
 final_message: "DBaaS bootstrap complete for %s"
 `,
