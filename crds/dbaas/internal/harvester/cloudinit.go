@@ -22,38 +22,44 @@ import (
 	"strings"
 )
 
-// dataNetNetplan returns the YAML body (already indented to the surrounding
-// `content: |` block) configuring the VM's single data NIC. When
-// StaticNetwork is nil the NIC runs DHCP; when it's set we emit a static
-// configuration so VLANs without a DHCP server still come up.
-func dataNetNetplan(p VMCreateParams) string {
+// buildNetworkData returns the cloud-init network-config v2 YAML for the
+// VM's single data NIC. KubeVirt's cloudInitNoCloud datasource reads it
+// from the Secret key `networkdata` and applies it at the `init-local`
+// stage — before systemd-networkd starts — so the NIC has its IP, gateway
+// and DNS before any module tries to talk to the network. (A write_files
+// netplan stanza is too late: it lands during the `config` stage, after
+// `apt update` has already failed for lack of routing.)
+//
+// When StaticNetwork is nil the NIC runs DHCP; when set, the supplied
+// values are written as the static configuration.
+func buildNetworkData(p VMCreateParams) string {
 	if p.StaticNetwork == nil {
-		return `      network:
-        version: 2
-        ethernets:
-          data:
-            match:
-              driver: virtio_net
-            dhcp4: true`
+		return `version: 2
+ethernets:
+  data:
+    match:
+      driver: virtio_net
+    dhcp4: true
+`
 	}
 	ns := p.StaticNetwork
 	search := ""
 	if len(ns.SearchDomains) > 0 {
-		search = fmt.Sprintf("\n              search: [%s]", strings.Join(ns.SearchDomains, ", "))
+		search = fmt.Sprintf("\n      search: [%s]", strings.Join(ns.SearchDomains, ", "))
 	}
-	return fmt.Sprintf(`      network:
-        version: 2
-        ethernets:
-          data:
-            match:
-              driver: virtio_net
-            dhcp4: false
-            addresses: [%s]
-            routes:
-              - to: default
-                via: %s
-            nameservers:
-              addresses: [%s]%s`,
+	return fmt.Sprintf(`version: 2
+ethernets:
+  data:
+    match:
+      driver: virtio_net
+    dhcp4: false
+    addresses: [%s]
+    routes:
+      - to: default
+        via: %s
+    nameservers:
+      addresses: [%s]%s
+`,
 		ns.Address,
 		ns.Gateway,
 		strings.Join(ns.Nameservers, ", "),
@@ -107,10 +113,6 @@ write_files:
       MAX_CONNECTIONS=%d
       LUKS_KEY=%s
       %s
-  - path: /etc/netplan/60-data-net.yaml
-    permissions: "0600"
-    content: |
-%s
   - path: /etc/ssl/certs/pg-ca.crt
     encoding: b64
     permissions: "0644"
@@ -166,7 +168,6 @@ write_files:
       EOSQL
 runcmd:
   - systemctl enable --now qemu-guest-agent
-  - netplan apply
   - mkdir -p /var/lib/dbaas
   - chown postgres:postgres /var/lib/dbaas
   - /etc/dbaas/bootstrap.sh
@@ -183,7 +184,6 @@ final_message: "DBaaS bootstrap complete for %s"
 		p.MaxConnections,
 		luksKey,
 		backupConfig,
-		dataNetNetplan(p),
 		caCertB64,
 		serverCertB64,
 		serverKeyB64,

@@ -209,8 +209,15 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 	}
 	caCertPEM = tls.CACertPEM
 
-	// Store credentials and cloud-init in K8s Secret
+	// Store credentials, cloud-init user data, and cloud-init network data
+	// in a K8s Secret. KubeVirt's cloudInitNoCloud datasource reads keys
+	// `userdata` and `networkdata` from this Secret and feeds them to the
+	// VM at the `init-local` stage — applying networkData early enough
+	// that systemd-networkd sees the right IP/gateway/DNS *before* it
+	// times out (which is what bit us when we tried writing the netplan
+	// via cloud-init's write_files module instead).
 	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, luksKey, tls)
+	networkData := buildNetworkData(p)
 	secret := newUnstructured("v1", "Secret", secretName, p.Namespace)
 	_ = unstructured.SetNestedField(secret.Object, "Opaque", "type")
 	_ = unstructured.SetNestedField(secret.Object, map[string]interface{}{
@@ -223,7 +230,8 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 		"ca_key":            tls.CAKeyPEM,
 		"server_cert":       tls.ServerCertPEM,
 		"server_key":        tls.ServerKeyPEM,
-		"userdata":          cloudInit, // referenced by VM spec; avoids plain-text in VM CR
+		"userdata":          cloudInit,
+		"networkdata":       networkData,
 	}, "stringData")
 	if _, e := c.Dynamic.Resource(secretGVR).Namespace(p.Namespace).Create(ctx, secret, metav1.CreateOptions{}); e != nil {
 		if err = ignoreAlreadyExists(e); err != nil {
