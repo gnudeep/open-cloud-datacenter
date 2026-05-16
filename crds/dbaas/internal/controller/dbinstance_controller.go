@@ -241,18 +241,16 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
 	ns := inst.Namespace
 
+	// VMI's status.interfaces[].ipAddress is populated by qemu-guest-agent.
+	// Our bootstrap.sh enables the agent only AFTER `apt install postgresql`
+	// has finished and the server is restarted, so the IP appearing here is
+	// a stricter signal than a wall-clock uptime heuristic ever was.
 	readiness, err := r.Harvester.GetVMIReadiness(ctx, ns, inst.Status.Resources.VMName)
 	if err != nil || !readiness.Running || readiness.IP == "" {
 		inst.Status.Message = "Waiting for VM to become ready"
 		inst.Status.ProvisioningPhase = dbaasv1.PhaseWaitingForCloudInit
 		_ = r.statusUpdate(ctx, inst)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	if !readiness.Ready {
-		inst.Status.Message = fmt.Sprintf("VM running at %s, waiting for PostgreSQL to finish initializing", readiness.IP)
-		_ = r.statusUpdate(ctx, inst)
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	port := specPort(inst.Spec.Port)

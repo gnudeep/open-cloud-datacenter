@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -99,11 +98,13 @@ type VMCreateParams struct {
 	StaticNetwork *dbaasv1.NetworkConfig
 }
 
-// VMIReadiness bundles phase, IP, and postgres-readiness from a single VMI fetch.
+// VMIReadiness bundles phase + IP from a single VMI fetch. The IP being
+// populated is itself a strong readiness signal: qemu-guest-agent registers
+// it only after our bootstrap.sh has finished `apt install postgresql ...`
+// and started the agent — so the caller does not need an extra timer.
 type VMIReadiness struct {
 	Running bool
 	IP      string
-	Ready   bool // Running AND uptime > 3 min
 }
 
 // ============================================================
@@ -361,8 +362,7 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 		ip = fallbackIP
 	}
 
-	ready := running && time.Since(vmi.GetCreationTimestamp().Time) > 3*time.Minute
-	return VMIReadiness{Running: running, IP: ip, Ready: ready}, nil
+	return VMIReadiness{Running: running, IP: ip}, nil
 }
 
 // setVMRunning sets spec.running on the VM.
