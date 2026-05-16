@@ -298,12 +298,17 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 				"volumes": []interface{}{
 					map[string]interface{}{"name": "os-disk", "dataVolume": map[string]interface{}{"name": fmt.Sprintf("pg-%s-os", p.ID)}},
 					map[string]interface{}{"name": "pgdata-disk", "dataVolume": map[string]interface{}{"name": p.DataVolumeRef}},
-					// userDataSecretRef + networkDataSecretRef must both be set
-					// explicitly: KubeVirt's legacy `secretRef` is an alias for
-					// userDataSecretRef only and silently ignores the
-					// `networkdata` key, which leaves the VM in DHCP mode.
+					// Harvester's VM mutating webhook silently strips the
+					// newer `userDataSecretRef` field while leaving
+					// `networkDataSecretRef` intact — the VM ends up with
+					// network config but NO user data, so cloud-init never
+					// runs our packages / runcmd / ssh_pwauth and the database
+					// never installs. Use the legacy `secretRef` (which
+					// Harvester recognises) for the userdata key, plus
+					// `networkDataSecretRef` for the networkdata key. Both
+					// point at the same Secret.
 					map[string]interface{}{"name": "cloudinit", "cloudInitNoCloud": map[string]interface{}{
-						"userDataSecretRef":    map[string]interface{}{"name": secretName},
+						"secretRef":            map[string]interface{}{"name": secretName},
 						"networkDataSecretRef": map[string]interface{}{"name": secretName},
 					}},
 				},
