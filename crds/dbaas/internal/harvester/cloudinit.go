@@ -163,12 +163,16 @@ ssh_pwauth: true
 
       systemctl restart postgresql
 
-      # Create admin user and database
+      # Create admin user and database. The master user gets CREATEDB and
+      # CREATEROLE so it can manage its own databases / roles, but NOT
+      # SUPERUSER — RDS-style master users shouldn't be able to bypass
+      # the engine's permission system. Database ownership is sufficient
+      # for all in-database operations (DDL, GRANT, etc.).
       sudo -u postgres psql -p "${DB_PORT}" <<EOSQL
       DO \$\$
       BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MASTER_USER}') THEN
-          CREATE ROLE ${MASTER_USER} LOGIN SUPERUSER PASSWORD '${MASTER_PASSWORD}';
+          CREATE ROLE ${MASTER_USER} LOGIN CREATEDB CREATEROLE PASSWORD '${MASTER_PASSWORD}';
         END IF;
       END \$\$;
       SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${MASTER_USER}'
