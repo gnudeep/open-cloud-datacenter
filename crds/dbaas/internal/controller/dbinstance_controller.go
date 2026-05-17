@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -329,13 +330,21 @@ func (r *DBInstanceReconciler) phaseMonitoring(ctx context.Context, inst *dbaasv
 }
 
 func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	// Snapshot the current status before mutating so we can skip the
+	// kube-apiserver round-trip when nothing actually changed. This phase
+	// runs on every 60s requeue for the lifetime of every Available
+	// DBInstance; a churn-free reconcile keeps audit-log volume and
+	// watch-event fanout down for clusters with many databases.
+	prev := inst.Status.DeepCopy()
+
 	inst.Status.Phase = dbaasv1.StatusAvailable
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseAvailable
 	inst.Status.ObservedGeneration = inst.Generation
 	inst.Status.Message = "Database instance is available"
 
-	// Re-check the vpc-net IP on every requeue — the guest agent may report it
-	// later than initial readiness, or it can change after a VM restart.
+	// Re-check the data-net IP on every requeue — the guest agent may
+	// report it later than initial readiness, or it can change after a VM
+	// restart.
 	readiness, _ := r.Harvester.GetVMIReadiness(ctx, inst.Namespace, inst.Status.Resources.VMName)
 	if readiness.IP != "" && (inst.Status.Endpoint == nil || inst.Status.Endpoint.Address != readiness.IP) {
 		port := specPort(inst.Spec.Port)
@@ -351,6 +360,10 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 		log.FromContext(ctx).Info("endpoint updated", "ip", readiness.IP)
 	}
 
+	if equality.Semantic.DeepEqual(prev, &inst.Status) {
+		// No status drift this cycle — skip the Update entirely.
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, r.statusUpdate(ctx, inst)
 }
 
