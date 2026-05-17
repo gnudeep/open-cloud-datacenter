@@ -185,6 +185,24 @@ func TestCreateInstance(t *testing.T) {
 	if rec := do(t, h, http.MethodPut, "/dbinstances", nil); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("PUT /dbinstances: got %d, want 405", rec.Code)
 	}
+
+	// A body that asks for a different namespace must NOT escape into
+	// that namespace — the gateway's get/patch/delete handlers only look
+	// in defaultNamespace(), so accepting a foreign namespace here would
+	// strand the new CR. The override should win silently.
+	wrongNS := sampleInstance("orders-2")
+	wrongNS.Namespace = "some-other-namespace"
+	rec = do(t, h, http.MethodPost, "/dbinstances", wrongNS)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST with foreign ns: got %d, want 202 (body: %s)", rec.Code, rec.Body)
+	}
+	// The created object must live in defaultNamespace, not in the body's value.
+	stranded := &dbaasv1.DBInstance{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "some-other-namespace", Name: "orders-2"}, stranded); !apierrors.IsNotFound(err) {
+		t.Fatalf("body namespace was honoured: got err=%v, want NotFound in some-other-namespace", err)
+	}
+	if _ = getInstance(t, c, "orders-2"); false { /* getInstance Fatals on miss */
+	}
 }
 
 func TestListInstances(t *testing.T) {

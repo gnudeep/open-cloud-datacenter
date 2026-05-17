@@ -214,9 +214,13 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	if instance.Kind == "" {
 		instance.Kind = "DBInstance"
 	}
-	if instance.Namespace == "" {
-		instance.Namespace = defaultNamespace()
-	}
+	// Always overwrite the namespace with the gateway's configured one.
+	// Every other handler (get/patch/delete/start/stop) only looks in
+	// defaultNamespace(); accepting a different value here would land the
+	// new CR somewhere this gateway can never see again. The K8s API
+	// server still does the final RBAC check on the caller's identity
+	// for the chosen namespace.
+	instance.Namespace = defaultNamespace()
 	if err := c.Create(r.Context(), &instance); err != nil {
 		writeAPIError(w, err)
 		return
