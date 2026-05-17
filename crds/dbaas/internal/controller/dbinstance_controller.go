@@ -348,6 +348,16 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 // ============================================================
 
 func (r *DBInstanceReconciler) reconcileStop(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	// A user who flips spec.running and also edits an immutable field in
+	// the same kubectl apply hits this path before reconcileModify (the
+	// dispatcher routes running-toggles first). Without this guard,
+	// observedGeneration silently catches up — same lie reconcileModify
+	// used to tell. Refuse the whole change with a clear message.
+	if drift := immutableDrift(inst); drift != "" {
+		return r.fail(ctx, inst, "ImmutableFieldChanged",
+			fmt.Errorf("cannot modify field(s) %s while stopping; revert or recreate the DBInstance", drift))
+	}
+
 	ns := inst.Namespace
 	inst.Status.Phase = dbaasv1.StatusStopping
 	inst.Status.Message = "Stopping VM"
@@ -364,6 +374,12 @@ func (r *DBInstanceReconciler) reconcileStop(ctx context.Context, inst *dbaasv1.
 }
 
 func (r *DBInstanceReconciler) reconcileStart(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
+	// See reconcileStop above — same drift guard for the start path.
+	if drift := immutableDrift(inst); drift != "" {
+		return r.fail(ctx, inst, "ImmutableFieldChanged",
+			fmt.Errorf("cannot modify field(s) %s while starting; revert or recreate the DBInstance", drift))
+	}
+
 	ns := inst.Namespace
 	inst.Status.Phase = dbaasv1.StatusStarting
 	_ = r.statusUpdate(ctx, inst)
