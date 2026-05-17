@@ -1,135 +1,102 @@
 # dbaas
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that provisions managed PostgreSQL databases as
+KubeVirt VMs on a Harvester HCI cluster. One `DBInstance` custom resource
+maps to one VM with persistent storage, SSL-only PostgreSQL, an admin
+credentials Secret, and optional Prometheus monitoring.
 
-## Getting Started
+Tested on **Harvester 1.7.1** (RKE2 v1.34.3) — full end-to-end from
+`kubectl apply` to `psql` round-trip in ~3 minutes.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## Pointers
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — design: components, phase state
+  machine, what gets created on Harvester, repo layout, what this version
+  intentionally is *not*.
+- [`DEPLOYMENT.md`](./DEPLOYMENT.md) — what a working deployment looks like
+  on the cluster, with the ASCII topology diagram and the two non-obvious
+  Harvester gotchas (the `cloudInitNoCloud.secretRef` quirk and the
+  cloud-init `networkData` channel).
+- [`USAGE.md`](./USAGE.md) — copy-paste install + operate guide: `make
+  install` / `make deploy`, applying a DBInstance, getting credentials,
+  connecting via `psql`, stop/start/modify/delete, the REST gateway
+  endpoints, troubleshooting recipes.
 
-```sh
-make docker-build docker-push IMG=<some-registry>/dbaas:tag
-```
+## What it does
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+- **API**: `DBInstance` in group `dbaas.opencloud.wso2.com/v1alpha1`,
+  namespaced, with the standard `kubectl get dbi -A` printer columns.
+- **Reconciler**: phase-based state machine (`NetworkProvisioned →
+  StorageProvisioned → VMCreated → WaitingForCloudInit → DatabaseReady →
+  MonitoringDeployed → Available`); idempotent and crash-safe via
+  `status.resources`.
+- **REST gateway**: a thin HTTP layer over the CRD exposing the same six
+  operations as `kubectl`; mutations are authenticated by forwarding the
+  caller's bearer token to the K8s API server (same authn/RBAC/audit path
+  as `kubectl`).
+- **Network model**: single NIC bridged onto a Multus
+  `NetworkAttachmentDefinition` the operator supplies via
+  `spec.networkRef`. DHCP by default; `spec.staticNetwork` for VLANs
+  without a DHCP server.
+- **Per-instance TLS**: ephemeral CA + server cert generated for each VM
+  and pinned via `status.caCertPem`. `pg_hba.conf` enforces
+  `hostssl … scram-sha-256` only.
 
-**Install the CRDs into the cluster:**
+## What's NOT in this version
 
-```sh
-make install
-```
+The CRD schema is broader than the implementation. The following spec
+fields are reserved for forward compatibility but **the reconciler does
+not act on them today**:
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+| Field | Status |
+| --- | --- |
+| `engineVersion` | Recorded but ignored; cloud-init installs the OS image's apt-default PostgreSQL (Ubuntu 24.04 → PG 16). |
+| `manageMasterUserPassword`, `masterUserPasswordRef` | Ignored; the controller always generates a random admin password into the credentials Secret. |
+| `s3BackupConfig`, `backupRetentionPeriod`, `preferredBackupWindow` | Values are recorded but no pgBackRest install, schedule, or retention runs. |
+| `multiAZ` | No Patroni / HA standby is created. |
+| `dbParameterGroupRef` | No `DBParameterGroup` CRD exists in this module. |
+| `tags` | Not propagated to child resource labels / annotations / dashboards. |
+| `status.conditions`, `status.readReplicas` | Defined for forward compatibility; not written by the reconciler. |
+| Per-instance `postgres_exporter` | Service + ServiceMonitor are created, but no exporter is installed inside the VM yet, so the scrape target won't return metrics. |
 
-```sh
-make deploy IMG=<some-registry>/dbaas:tag
-```
+Each is called out in the field's godoc (`kubectl explain dbi.spec.<field>`)
+and in `ARCHITECTURE.md`. They will be implemented incrementally; the
+schema shape is deliberately stable so users can write manifests today
+that work later.
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+## Quickstart
 
 ```sh
-make build-installer IMG=<some-registry>/dbaas:tag
+# In this directory (crds/dbaas/), from a host with kubectl + docker buildx:
+make docker-buildx IMG=<registry>/<name>:<tag>
+KUBECONFIG=<your-harvester-kubeconfig> make install
+KUBECONFIG=<your-harvester-kubeconfig> make deploy IMG=<registry>/<name>:<tag>
+
+# Then apply a DBInstance — full YAML and walkthrough in USAGE.md
+kubectl get dbi -A -w
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+Expected time from `apply` to `phase=available`: about **3 minutes** on
+stock Ubuntu cloud images, ~60 s if you pre-bake PostgreSQL into a
+custom image (see `DEPLOYMENT.md`).
 
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+## Build / test / develop
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/dbaas/<tag or branch>/dist/install.yaml
+make manifests generate fmt vet build   # regenerate CRD + DeepCopy, build manager
+make test                               # envtest-backed unit tests
+make docker-buildx IMG=...              # cross-build linux/amd64, push
+make install                            # apply CRD using current kubeconfig
+make deploy IMG=...                     # apply manager + RBAC
+make undeploy && make uninstall         # tear it all down
 ```
 
-### By providing a Helm Chart
+## Part of Open Cloud Datacenter
 
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+This component lives in the [WSO2 Open Cloud
+Datacenter](https://github.com/wso2/open-cloud-datacenter) initiative,
+providing managed database services on Harvester HCI.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache-2.0

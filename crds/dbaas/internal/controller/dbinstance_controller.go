@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -232,6 +233,19 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 		Name:   secretName,
 		Status: dbaasv1.SecretStatusActive,
 	}
+	// Snapshot the immutable fields as they were applied. reconcileModify
+	// later refuses any spec change that drifts from this snapshot, so the
+	// CR never reports observedGeneration=current for changes we silently
+	// couldn't carry through to the running VM.
+	inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{
+		NetworkRef:     inst.Spec.NetworkRef,
+		OSImage:        osImage,
+		DBName:         dbName,
+		MasterUsername: masterUser,
+		EngineVersion:  inst.Spec.EngineVersion,
+		Port:           inst.Spec.Port,
+		StorageType:    inst.Spec.StorageType,
+	}
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseVMCreated
 	inst.Status.Message = "VM created, waiting for PostgreSQL to initialize"
 
@@ -279,13 +293,18 @@ func (r *DBInstanceReconciler) phaseMonitoring(ctx context.Context, inst *dbaasv
 	id := inst.Name
 	ns := inst.Namespace
 
-	smName, grafanaURL, promTarget, err := r.Harvester.DeployMonitoring(ctx, id, ns, inst.Status.Endpoint.Address, inst.Status.Endpoint.Port)
+	svcName, smName, grafanaURL, promTarget, err := r.Harvester.DeployMonitoring(ctx, id, ns)
 	if err != nil {
-		// Non-fatal — DB works without monitoring
+		// Non-fatal — DB works without monitoring. Track the Service name
+		// regardless: DeployMonitoring creates the Service first, so a
+		// partial failure may leave the Service behind for the finalizer
+		// to clean up.
 		log.FromContext(ctx).Error(err, "monitoring setup failed (non-fatal)")
 		inst.Status.Message = "Available (monitoring setup failed, will retry)"
+		inst.Status.Resources.MetricsServiceName = svcName
 	} else {
 		inst.Status.Resources.ServiceMonitor = smName
+		inst.Status.Resources.MetricsServiceName = svcName
 		inst.Status.GrafanaURL = grafanaURL
 		inst.Status.PrometheusTarget = promTarget
 	}
@@ -357,6 +376,16 @@ func (r *DBInstanceReconciler) reconcileStart(ctx context.Context, inst *dbaasv1
 
 func (r *DBInstanceReconciler) reconcileModify(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
 	ns := inst.Namespace
+
+	// Refuse the modify if any field we can't re-apply has drifted from the
+	// snapshot taken at create time. Without this guard we silently set
+	// observedGeneration = generation even when a user changed networkRef
+	// or dbName, leaving them to believe the controller honoured it.
+	if drift := immutableDrift(inst); drift != "" {
+		return r.fail(ctx, inst, "ImmutableFieldChanged",
+			fmt.Errorf("cannot modify field(s) %s after create; revert or recreate the DBInstance", drift))
+	}
+
 	inst.Status.Phase = dbaasv1.StatusModifying
 	_ = r.statusUpdate(ctx, inst)
 
@@ -386,9 +415,44 @@ func (r *DBInstanceReconciler) reconcileModify(ctx context.Context, inst *dbaasv
 	}
 
 	inst.Status.Phase = dbaasv1.StatusAvailable
-	inst.Status.Message = "Modifications applied"
+	inst.Status.Message = fmt.Sprintf("Resized to %s, %dGiB", inst.Spec.DBInstanceClass, inst.Spec.AllocatedStorage)
 	inst.Status.ObservedGeneration = inst.Generation
 	return ctrl.Result{}, r.statusUpdate(ctx, inst)
+}
+
+// immutableDrift returns a comma-separated list of immutable spec fields
+// that have drifted from the snapshot recorded at create time, or "" if no
+// drift exists. If the snapshot is missing (older instances created before
+// the snapshot was introduced), drift is treated as zero so we don't break
+// existing deployments.
+func immutableDrift(inst *dbaasv1.DBInstance) string {
+	a := inst.Status.AppliedSpec
+	if a == nil {
+		return ""
+	}
+	var changed []string
+	if a.NetworkRef != inst.Spec.NetworkRef {
+		changed = append(changed, "networkRef")
+	}
+	if a.OSImage != inst.Spec.OSImage {
+		changed = append(changed, "osImage")
+	}
+	if a.DBName != inst.Spec.DBName {
+		changed = append(changed, "dbName")
+	}
+	if a.MasterUsername != inst.Spec.MasterUsername {
+		changed = append(changed, "masterUsername")
+	}
+	if a.EngineVersion != inst.Spec.EngineVersion {
+		changed = append(changed, "engineVersion")
+	}
+	if a.Port != inst.Spec.Port {
+		changed = append(changed, "port")
+	}
+	if a.StorageType != inst.Spec.StorageType {
+		changed = append(changed, "storageType")
+	}
+	return strings.Join(changed, ",")
 }
 
 func (r *DBInstanceReconciler) reconcileDelete(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
@@ -406,7 +470,14 @@ func (r *DBInstanceReconciler) reconcileDelete(ctx context.Context, inst *dbaasv
 	_ = r.statusUpdate(ctx, inst)
 
 	logger.Info("Tearing down child resources", "namespace", ns)
-	r.Harvester.TeardownAll(ctx, inst.Name, ns, inst.Status.Resources)
+	if err := r.Harvester.TeardownAll(ctx, inst.Name, ns, inst.Status.Resources); err != nil {
+		// Surface the failure on the CR and requeue. The finalizer stays
+		// in place so a partial cleanup can't leave the CR garbage-collected
+		// with live Harvester children behind it.
+		inst.Status.Message = fmt.Sprintf("Teardown failed, will retry: %v", err)
+		_ = r.statusUpdate(ctx, inst)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, err
+	}
 	// The tenant namespace is owned by the cluster operator (created during
 	// onboarding) — never delete it. We only remove the resources we created.
 

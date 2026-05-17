@@ -291,13 +291,16 @@ curl -sS -H "$AUTH" -X POST "$GATEWAY/dbinstances" \
 # describe
 curl -sS -H "$AUTH" "$GATEWAY/dbinstances/orders-prod" | jq '.status'
 
-# modify (resize + new backup window)
+# modify — only dbInstanceClass and allocatedStorage are actually applied today.
+# The reconciler refuses any change to immutable fields (dbName, networkRef,
+# osImage, port, …) and reports `status.phase=failed` with a clear message.
+# Backup-window / retention fields are accepted by the PATCH endpoint but
+# not yet implemented end-to-end on the VM side.
 curl -sS -H "$AUTH" -X PATCH "$GATEWAY/dbinstances/orders-prod" \
   -H "Content-Type: application/json" \
   -d '{
     "dbInstanceClass": "db.m5.large",
-    "allocatedStorage": 200,
-    "backupRetentionPeriod": 14
+    "allocatedStorage": 200
   }' | jq '.status.phase'
 
 # stop / start

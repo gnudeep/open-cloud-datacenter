@@ -54,7 +54,12 @@ var _ = Describe("DBInstance Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: dbaasv1alpha1.DBInstanceSpec{
+						// Minimum spec to clear CRD OpenAPI validation.
+						DBInstanceClass:  "db.t3.small",
+						AllocatedStorage: 20,
+						NetworkRef:       "default/vm-network",
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

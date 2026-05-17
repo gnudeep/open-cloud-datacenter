@@ -127,9 +127,9 @@ is created in the same namespace.
 | `vmPassword` |   | — | Console/SSH password for the `ubuntu` user. Development only — leave empty in production. |
 | `running` |   | `true` | `false` stops the VM (storage preserved). |
 | `deletionProtection` |   | `false` | When true, the controller refuses to teardown the instance. |
-| `backupRetentionPeriod` |   | `0` | Days of pgBackRest retention. `0` disables backups. |
+| `backupRetentionPeriod` |   | `0` | Days of pgBackRest retention. `0` disables backups. **NOT YET IMPLEMENTED** — value is recorded but no backup process runs. |
 | `preferredBackupWindow` |   | — | UTC `HH:MM-HH:MM`. |
-| `s3BackupConfig` |   | — | `{endpoint, bucket, region, secretRef}` for pgBackRest. |
+| `s3BackupConfig` |   | — | `{endpoint, bucket, region, secretRef}` for pgBackRest. **NOT YET IMPLEMENTED** — values are written to `/etc/dbaas/bootstrap.env` on the VM but no backup process consumes them. |
 | `multiAZ` |   | `false` | Reserved for Patroni HA; not implemented yet. |
 | `dbParameterGroupRef` |   | — | Reserved for a future `DBParameterGroup` CRD. |
 | `tags` |   | — | User labels carried through to monitoring dashboards. |
@@ -248,7 +248,7 @@ creates:
 | Secret (Opaque) | `pg-orders-prod-credentials` | `admin_user`, `admin_password`, `repl_password`, `exporter_password`, `luks_key`, `ca_cert`, `ca_key`, `server_cert`, `server_key`, `userdata` (cloud-init). |
 | CDI DataVolume | `pg-orders-prod-data` | `spec.allocatedStorage` GiB, `Block` mode, ReadWriteOnce, `storageClassName = spec.storageType` (default `longhorn`). |
 | KubeVirt VirtualMachine | `pg-orders-prod` | One NIC `data-net` bridged onto `spec.networkRef`; OS disk cloned from a Harvester `VirtualMachineImage`; `pgdata-disk` from the DataVolume; `cloudinit` sourced from the Secret. |
-| Service (headless) | `pg-orders-prod-metrics` | Selects on `dbaas.opencloud.wso2.com/instance=<id>`, port `9187` (postgres_exporter). |
+| Service (headless) | `pg-orders-prod-metrics` | Selects on `dbaas.opencloud.wso2.com/instance=<id>`, port `9187` (would be `postgres_exporter`). **NOT YET IMPLEMENTED**: the Service is created, but the VM doesn't run an exporter, so Prometheus will scrape a closed port until that's wired in. |
 | ServiceMonitor | `pg-orders-prod-monitor` | 15s scrape, matchLabels `metrics=true` + `instance=<id>`. |
 
 All objects carry the `dbaas.opencloud.wso2.com/instance=<id>` label so they
@@ -357,6 +357,24 @@ you don't go looking for the code:
   them; this module has only `DBInstance`).
 - **No `multiAZ` / Patroni HA** — the field exists in the spec but the
   reconciler ignores it.
+- **No working `engineVersion`** — the field is recorded but cloud-init
+  installs whatever PostgreSQL the OS image's apt repo provides (Ubuntu
+  24.04 → PG 16). Set the right OS image to get the right version.
+- **No user-supplied admin password.** `manageMasterUserPassword` and
+  `masterUserPasswordRef` are both ignored; the controller always
+  generates a random password into the credentials Secret.
+- **No real backups.** `s3BackupConfig` / `backupRetentionPeriod` /
+  `preferredBackupWindow` values are surfaced in `/etc/dbaas/bootstrap.env`
+  on the VM but no pgBackRest install, schedule, or retention enforcement
+  runs.
+- **No working monitoring exporter.** The Service and ServiceMonitor are
+  created and tracked for cleanup, but the VM doesn't run
+  `postgres_exporter` — the scrape target is closed.
+- **No `tags` propagation** — declared but not pushed to any child
+  resource labels / annotations / dashboards.
+- **No `status.conditions` / `status.readReplicas`** — fields exist in
+  the schema for forward compatibility but the reconciler doesn't write
+  them.
 - **No TLS termination inside the gateway.** Authentication is enforced
   via K8s API server delegation (bearer-token forwarding), but the HTTP
   endpoint itself is plain. Front it with an ingress that terminates TLS

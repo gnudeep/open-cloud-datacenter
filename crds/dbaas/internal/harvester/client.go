@@ -419,9 +419,14 @@ func (c *Client) ResizeVM(ctx context.Context, ns, vmName string, cpuCores, memo
 // Monitoring
 // ============================================================
 
-func (c *Client) DeployMonitoring(ctx context.Context, id, ns, vmAddr string, pgPort int) (smName, grafanaURL, promTarget string, err error) {
+// DeployMonitoring creates the headless metrics Service and a Prometheus
+// ServiceMonitor for the instance. It returns the Service name, the
+// ServiceMonitor name, the Grafana dashboard URL, and the Prometheus
+// scrape target. The caller stores both names in status.resources so the
+// finalizer can delete them later.
+func (c *Client) DeployMonitoring(ctx context.Context, id, ns string) (svcName, smName, grafanaURL, promTarget string, err error) {
 	smName = fmt.Sprintf("pg-%s-monitor", id)
-	svcName := fmt.Sprintf("pg-%s-metrics", id)
+	svcName = fmt.Sprintf("pg-%s-metrics", id)
 	grafanaURL = fmt.Sprintf("%s/d/dbaas-%s/postgresql-%s", c.GrafanaURL, id, id)
 	promTarget = fmt.Sprintf("%s.%s.svc:9187", svcName, ns)
 
@@ -454,11 +459,16 @@ func (c *Client) DeployMonitoring(ctx context.Context, id, ns, vmAddr string, pg
 // Teardown
 // ============================================================
 
-// TeardownAll deletes every Harvester resource the controller created for this
-// DBInstance, in parallel. The NetworkAttachmentDefinition is always assumed
-// to be owned by the cluster operator (referenced via spec.networkRef) and is
-// not deleted here.
-func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.ResourceRefs) {
+// TeardownAll deletes every Harvester resource the controller created for
+// this DBInstance, in parallel, and returns an aggregated error if any
+// delete failed for a reason other than NotFound. The caller (the
+// reconcileDelete finalizer path) must keep the finalizer in place until
+// this returns nil — otherwise orphan VMs / DataVolumes / Secrets / Services
+// can be left behind after the CR is gone.
+//
+// The NetworkAttachmentDefinition is always assumed to be owned by the
+// cluster operator (referenced via spec.networkRef) and is never deleted.
+func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.ResourceRefs) error {
 	type deleteTask struct {
 		gvr       schema.GroupVersionResource
 		namespace string
@@ -466,12 +476,17 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 	}
 	tasks := []deleteTask{
 		{smGVR, ns, refs.ServiceMonitor},
+		{serviceGVR, ns, refs.MetricsServiceName},
 		{vmGVR, ns, refs.VMName},
 		{dvGVR, ns, refs.DataVolumeName},
 		{secretGVR, ns, refs.SecretName},
 	}
 
-	var wg sync.WaitGroup
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []string
+	)
 	for _, t := range tasks {
 		if t.name == "" {
 			continue
@@ -479,14 +494,25 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 		wg.Add(1)
 		go func(dt deleteTask) {
 			defer wg.Done()
+			var err error
 			if dt.namespace != "" {
-				_ = c.Dynamic.Resource(dt.gvr).Namespace(dt.namespace).Delete(ctx, dt.name, metav1.DeleteOptions{})
+				err = c.Dynamic.Resource(dt.gvr).Namespace(dt.namespace).Delete(ctx, dt.name, metav1.DeleteOptions{})
 			} else {
-				_ = c.Dynamic.Resource(dt.gvr).Delete(ctx, dt.name, metav1.DeleteOptions{})
+				err = c.Dynamic.Resource(dt.gvr).Delete(ctx, dt.name, metav1.DeleteOptions{})
 			}
+			if err == nil || apierrors.IsNotFound(err) {
+				return
+			}
+			mu.Lock()
+			errs = append(errs, fmt.Sprintf("%s/%s: %v", dt.gvr.Resource, dt.name, err))
+			mu.Unlock()
 		}(t)
 	}
 	wg.Wait()
+	if len(errs) > 0 {
+		return fmt.Errorf("teardown: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // ============================================================
