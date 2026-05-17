@@ -33,6 +33,17 @@ import (
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/harvester"
 )
 
+// Controller-side defaults for fields the user can leave blank on the
+// DBInstance spec. Centralised here so phaseStorage, phaseVM, and
+// immutableDrift can't drift apart over time. A change here should be
+// rare and accompanied by docs/USAGE updates.
+const (
+	defaultOSImage     = "ubuntu-22.04-server-cloudimg-amd64.img"
+	defaultStorageType = "longhorn"
+	defaultMasterUser  = "dbadmin"
+	defaultPort        = 5432
+)
+
 // DBInstanceReconciler reconciles DBInstance CRDs.
 // Each Reconcile call advances exactly one provisioning phase,
 // updates the status, and requeues for the next phase.
@@ -162,7 +173,7 @@ func (r *DBInstanceReconciler) phaseStorage(ctx context.Context, inst *dbaasv1.D
 	ns := inst.Namespace
 	storageType := inst.Spec.StorageType
 	if storageType == "" {
-		storageType = "longhorn"
+		storageType = defaultStorageType
 	}
 
 	dvName, err := r.Harvester.CreateDataVolume(ctx, id, ns, inst.Spec.AllocatedStorage, storageType)
@@ -193,7 +204,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 
 	masterUser := inst.Spec.MasterUsername
 	if masterUser == "" {
-		masterUser = "dbadmin"
+		masterUser = defaultMasterUser
 	}
 	dbName := inst.Spec.DBName
 	if dbName == "" {
@@ -201,11 +212,11 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	}
 	osImage := inst.Spec.OSImage
 	if osImage == "" {
-		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+		osImage = defaultOSImage
 	}
 	storageType := inst.Spec.StorageType
 	if storageType == "" {
-		storageType = "longhorn"
+		storageType = defaultStorageType
 	}
 
 	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
@@ -452,7 +463,7 @@ func immutableDrift(inst *dbaasv1.DBInstance) string {
 	}
 	osImage := inst.Spec.OSImage
 	if osImage == "" {
-		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+		osImage = defaultOSImage
 	}
 	dbName := inst.Spec.DBName
 	if dbName == "" {
@@ -460,17 +471,17 @@ func immutableDrift(inst *dbaasv1.DBInstance) string {
 	}
 	masterUser := inst.Spec.MasterUsername
 	if masterUser == "" {
-		masterUser = "dbadmin"
+		masterUser = defaultMasterUser
 	}
 	port := specPort(inst.Spec.Port)
 	storageType := inst.Spec.StorageType
 	if storageType == "" {
-		storageType = "longhorn"
+		storageType = defaultStorageType
 	}
 
 	appliedOSImage := a.OSImage
 	if appliedOSImage == "" {
-		appliedOSImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+		appliedOSImage = defaultOSImage
 	}
 	appliedDBName := a.DBName
 	if appliedDBName == "" {
@@ -478,7 +489,7 @@ func immutableDrift(inst *dbaasv1.DBInstance) string {
 	}
 	appliedMasterUser := a.MasterUsername
 	if appliedMasterUser == "" {
-		appliedMasterUser = "dbadmin"
+		appliedMasterUser = defaultMasterUser
 	}
 	appliedPort := a.Port
 	if appliedPort == 0 {
@@ -486,7 +497,7 @@ func immutableDrift(inst *dbaasv1.DBInstance) string {
 	}
 	appliedStorageType := a.StorageType
 	if appliedStorageType == "" {
-		appliedStorageType = "longhorn"
+		appliedStorageType = defaultStorageType
 	}
 
 	var changed []string
@@ -567,7 +578,7 @@ func (r *DBInstanceReconciler) statusUpdate(ctx context.Context, inst *dbaasv1.D
 // specPort returns 5432 if port is 0, otherwise port.
 func specPort(port int) int {
 	if port == 0 {
-		return 5432
+		return defaultPort
 	}
 	return port
 }

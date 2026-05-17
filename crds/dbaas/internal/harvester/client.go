@@ -63,7 +63,15 @@ var (
 	}
 )
 
-const vmiPhaseRunning = "Running"
+const (
+	vmiPhaseRunning = "Running"
+	// dataNetInterface is the VM's single NIC name. It must agree in
+	// three places: the KubeVirt VM spec's `domain.devices.interfaces`,
+	// the `template.spec.networks` list, and the GetVMIReadiness
+	// preference loop that picks the right IP off the VMI status.
+	// A single source of truth here keeps them coupled.
+	dataNetInterface = "data-net"
+)
 
 // Client wraps the Kubernetes dynamic client for Harvester API calls.
 type Client struct {
@@ -350,7 +358,7 @@ func (c *Client) GetVMIReadiness(ctx context.Context, ns, vmName string) (VMIRea
 			continue
 		}
 		name, _ := ifMap["name"].(string)
-		if name == "data-net" {
+		if name == dataNetInterface {
 			ip = addr
 			break
 		}
@@ -529,7 +537,7 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 // pod-network management NIC.
 func vmInterfaces() []interface{} {
 	return []interface{}{
-		map[string]interface{}{"name": "data-net", "bridge": map[string]interface{}{}},
+		map[string]interface{}{"name": dataNetInterface, "bridge": map[string]interface{}{}},
 	}
 }
 
@@ -540,7 +548,7 @@ func vmNetworks(namespace, nadName string) []interface{} {
 	}
 	return []interface{}{
 		map[string]interface{}{
-			"name":   "data-net",
+			"name":   dataNetInterface,
 			"multus": map[string]interface{}{"networkName": networkName},
 		},
 	}
