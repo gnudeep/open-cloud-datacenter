@@ -1,28 +1,27 @@
 # DBaaS CRD Analysis
 
-Fresh static analysis of the `DBInstance` CRD and its controller implementation.
+Fresh static analysis of the current `DBInstance` CRD and controller implementation.
 
 ## Scope
 
 Reviewed files:
 
 - `api/v1alpha1/dbinstance_types.go`
+- `api/v1alpha1/zz_generated.deepcopy.go`
 - `config/crd/bases/dbaas.opencloud.wso2.com_dbinstances.yaml`
 - `internal/controller/dbinstance_controller.go`
 - `internal/harvester/client.go`
 - `internal/harvester/cloudinit.go`
 - `internal/gateway/gateway.go`
-- `internal/controller/dbinstance_controller_test.go`
-- `internal/gateway/gateway_test.go`
-- `ARCHITECTURE.md`, `USAGE.md`, `DEPLOYMENT.md`, and `README.md`
+- `README.md`, `ARCHITECTURE.md`, `USAGE.md`, `DEPLOYMENT.md`, and `DEFERRED.md`
 
-This is a code and manifest review only. I did not run the operator against a Harvester cluster.
+This is a code and manifest review. I did not run the operator against a Harvester cluster.
 
 ## Executive Summary
 
-The core shape is sound: one namespaced `DBInstance` custom resource maps to one PostgreSQL VM on Harvester, backed by CDI storage, a credentials/cloud-init Secret, and optional monitoring resources. The reconciler is simple and phase-based, which makes the lifecycle easy to reason about.
+The code has improved materially since the previous review. The CRD now documents field support status, generated validation is stronger, `AppliedSpec` was added to make immutable-field drift visible, the metrics Service is now tracked for cleanup, `TeardownAll` returns aggregated errors, and documentation now calls out deferred features more honestly.
 
-The main problem is API drift. The CRD exposes a broader contract than the controller actually implements. Some fields are fully supported, some are create-time only, some are only partially wired, and several are currently no-ops. The riskiest mismatches are credentials, engine version, backups, monitoring, day-2 modify behavior, and cleanup.
+The remaining risk is narrower but still important. Credentials, PostgreSQL version selection, backups, per-instance exporter installation, status conditions, and real reconciler test coverage remain incomplete. There is also a new modify-path correctness issue: `AppliedSpec` snapshots defaulted values for some immutable fields, then compares them later against raw optional spec fields. That can make legitimate mutable updates fail on instances that omitted those optional fields at creation time.
 
 ## Resource Model
 
@@ -49,16 +48,21 @@ Printer columns:
 - `status.endpoint.address`
 - `metadata.creationTimestamp`
 
-The CRD schema mostly comes directly from Go struct shape. It has required-field checks and a default for `spec.running`, but very little semantic validation.
+Newer status fields:
+
+- `status.appliedSpec`
+- `status.resources.metricsServiceName`
+
+These are present in both Go types and the generated CRD manifest.
 
 ## Implemented Lifecycle
 
 The reconciler advances through these phases:
 
 1. `NetworkProvisioned`
-   - Checks only that `spec.networkRef` is not empty.
+   - Checks only that `spec.networkRef` is non-empty.
    - Records the value in `status.resources.nadName`.
-   - Does not verify the referenced NAD exists.
+   - Does not verify that the referenced NAD exists.
 
 2. `StorageProvisioned`
    - Creates CDI DataVolume `pg-<name>-data`.
@@ -69,6 +73,7 @@ The reconciler advances through these phases:
    - Defaults `masterUsername`, `dbName`, and `osImage`.
    - Generates credentials, TLS material, cloud-init data, and a KubeVirt VM.
    - Writes credentials and cloud-init data into Secret `pg-<name>-credentials`.
+   - Records an `AppliedSpec` snapshot for selected immutable fields.
 
 4. `WaitingForCloudInit`
    - Polls the VMI.
@@ -79,8 +84,9 @@ The reconciler advances through these phases:
    - Builds a JDBC URL using `sslmode=verify-ca`.
 
 6. `MonitoringDeployed`
-   - Creates a headless Service on port `9187`.
+   - Creates a headless metrics Service on port `9187`.
    - Creates a Prometheus `ServiceMonitor`.
+   - Records both names for cleanup.
    - Marks monitoring failures as non-fatal.
 
 7. `Available`
@@ -91,312 +97,280 @@ The reconciler advances through these phases:
 Implemented day-2 operations:
 
 - Stop and start through `spec.running`.
-- Resize VM CPU/memory and the data DataVolume.
-- Delete via finalizer.
+- Resize VM CPU/memory from `dbInstanceClass`.
+- Resize data DataVolume from `allocatedStorage`.
+- Refuse changes to selected immutable fields using `status.appliedSpec`.
+- Delete through a finalizer.
 - Block finalizer cleanup when `spec.deletionProtection` is true.
 
 ## Field Support Matrix
 
 | Field | Current behavior |
 | --- | --- |
-| `dbInstanceClass` | Required. Used at create and modify time through `InstanceClasses`. Invalid values fail during reconcile, not admission. |
-| `allocatedStorage` | Required. Used for data DataVolume creation and resize. No minimum or shrink protection in CRD validation. |
-| `networkRef` | Required string. Only checked for non-empty. Not validated for `namespace/name` shape or actual NAD existence. |
-| `dbName` | Used at VM creation and endpoint URL generation. Later changes do not alter the running database. |
-| `port` | Used in cloud-init and endpoint URL. No port range validation. Later changes do not reconfigure PostgreSQL. |
-| `masterUsername` | Used only at VM creation. Later changes do not alter the running database. |
-| `manageMasterUserPassword` | Declared but ignored. Credentials are always generated by the controller. |
-| `masterUserPasswordRef` | Declared but ignored. User-provided password Secrets are not read. |
-| `storageType` | Used only when creating the data DataVolume. Later changes do not migrate storage class. |
-| `backupRetentionPeriod` | Used only as `> 0` to decide whether backup env text is written. No retention implementation observed. |
-| `preferredBackupWindow` | Passed into `VMCreateParams` but not consumed by cloud-init or any scheduler. |
-| `s3BackupConfig` | Written into `/etc/dbaas/bootstrap.env` text when backups are enabled. No pgBackRest setup consumes it. |
-| `engineVersion` | Declared but ignored. Bootstrap installs unversioned `postgresql` packages from apt. |
-| `multiAZ` | Declared but ignored. No Patroni, standby VM, or HA path exists. |
-| `dbParameterGroupRef` | Declared but ignored. No `DBParameterGroup` reconciliation exists. |
+| `dbInstanceClass` | Required. Used at create and modify time through `InstanceClasses`. Has `MinLength=1`, but no enum validation. |
+| `allocatedStorage` | Required. Used for data DataVolume creation and resize. Has `Minimum=1`, but no explicit max or shrink guard before CDI/Longhorn receives the update. |
+| `networkRef` | Required. Pattern-validates `namespace/name` shape. Reconciler still does not check NAD existence. |
+| `dbName` | Used at VM creation and endpoint URL generation. Intended immutable after create. |
+| `port` | Used in cloud-init and endpoint URL. Has `Minimum=1` and `Maximum=65535`. Intended immutable after create. |
+| `masterUsername` | Used only at VM creation. Intended immutable after create. |
+| `manageMasterUserPassword` | Declared reserved. Still ignored. Credentials are always generated by the controller. |
+| `masterUserPasswordRef` | Declared reserved. Still ignored. User-provided password Secrets are not read. |
+| `storageType` | Used only when creating the data DataVolume. Intended immutable after create. |
+| `backupRetentionPeriod` | Reserved/inert. Has `Minimum=0`. No backup implementation observed. |
+| `preferredBackupWindow` | Reserved/inert. Has an `HH:MM-HH:MM` validation pattern, but no scheduler consumes it. |
+| `s3BackupConfig` | Reserved/inert. Values are written into `/etc/dbaas/bootstrap.env` only when backups are enabled. No pgBackRest setup consumes them. |
+| `engineVersion` | Reserved/inert. Snapshotted as immutable, but cloud-init installs unversioned `postgresql` packages from apt. |
+| `multiAZ` | Reserved/inert. No Patroni, standby VM, or HA path exists. |
+| `dbParameterGroupRef` | Reserved/inert. No `DBParameterGroup` reconciliation exists. |
 | `deletionProtection` | Implemented. Deletion finalizer refuses cleanup while true. |
 | `running` | Implemented after initial creation for stop/start. Default is encoded as `true` in the CRD. |
-| `osImage` | Used at VM creation to resolve Harvester `VirtualMachineImage`. Later changes do not rebuild the VM. |
-| `staticNetwork` | Used at VM creation to generate cloud-init network data. No IP/CIDR validation. |
-| `vmPassword` | Used at VM creation to enable password auth. This is marked development-only but not blocked by validation. |
-| `tags` | Declared but ignored. Not propagated to child labels, annotations, dashboards, or monitoring. |
+| `osImage` | Used at VM creation to resolve Harvester `VirtualMachineImage`. Intended immutable after create. |
+| `staticNetwork` | Used at VM creation to generate cloud-init network data. Partial OpenAPI validation exists. Intended immutable, but not included in `AppliedSpec`. |
+| `vmPassword` | Used at VM creation to enable password auth. Intended immutable, but not included in `AppliedSpec`. |
+| `tags` | Reserved/inert. Not propagated to child labels, annotations, dashboards, or monitoring. |
 | `status.conditions` | Declared but never written. |
 | `status.readReplicas` | Declared but never written. |
+| `status.appliedSpec` | New. Used by `immutableDrift` to refuse selected immutable-field changes. Has a default-normalization issue described below. |
+| `status.resources.metricsServiceName` | New. Used by cleanup to delete the per-instance metrics Service. |
 
-## Main Findings
+## Resolved Or Improved Since Last Review
 
-### 1. Credential API is misleading
+### Cleanup is no longer fire-and-forget
 
-The CRD suggests two password modes:
+Previous issue:
 
-- auto-generate with `manageMasterUserPassword: true`
-- read an existing Secret through `masterUserPasswordRef`
+- `TeardownAll` ignored delete errors.
+- The finalizer was removed even if cleanup failed.
+- The per-instance metrics Service was not tracked or deleted.
 
-The implementation always generates a random admin password in `CreatePostgresVM` and writes it into the controller-created Secret. It never reads `manageMasterUserPassword` or `masterUserPasswordRef`.
+Current state:
+
+- `ResourceRefs` now includes `metricsServiceName`.
+- `phaseMonitoring` stores both Service and ServiceMonitor names.
+- `TeardownAll` deletes ServiceMonitor, metrics Service, VM, data DataVolume, and Secret.
+- `TeardownAll` ignores `NotFound` but aggregates other errors.
+- `reconcileDelete` keeps the finalizer and requeues when teardown fails.
+
+Remaining caveat:
+
+- The OS DataVolume created through the VM `dataVolumeTemplates` is still not explicitly tracked in `status.resources`. It may be cleaned up through KubeVirt ownership behavior, but it is not represented in the DBaaS status model.
+
+### Modify behavior is more honest, but needs a bug fix
+
+Previous issue:
+
+- Any spec generation change caused resize logic to run and then set `observedGeneration`, even if changed fields were unsupported.
+
+Current state:
+
+- `AppliedSpec` snapshots selected immutable fields at VM creation.
+- `reconcileModify` refuses drift in selected immutable fields before resizing.
+- `observedGeneration` is no longer blindly advanced for those selected immutable changes.
+
+Remaining bug:
+
+- The snapshot stores defaulted values for `osImage`, `dbName`, and `masterUsername`, but `immutableDrift` compares them against raw `inst.Spec.OSImage`, `inst.Spec.DBName`, and `inst.Spec.MasterUsername`.
+- If a user omitted those fields at create time, the snapshot contains values like `ubuntu-22.04-server-cloudimg-amd64.img`, instance name, and `dbadmin`, while the current spec still contains empty strings.
+- A later legitimate resize or `deletionProtection` patch can fail with `ImmutableFieldChanged` even though the user did not change any immutable field.
+
+Recommended fix:
+
+- Either snapshot the raw spec values, or normalize current spec values before comparison.
+- Also include `staticNetwork` and `vmPassword` in the immutable drift model if they are intended to be immutable.
+
+### CRD validation is stronger
+
+New validation now exists for:
+
+- `dbInstanceClass` minimum length
+- `allocatedStorage >= 1`
+- `port` range `1-65535`
+- `backupRetentionPeriod >= 0`
+- `preferredBackupWindow` format
+- `networkRef` shape
+- `staticNetwork.address`
+- `staticNetwork.gateway`
+- `staticNetwork.nameservers` minimum item count
+
+Remaining validation gaps:
+
+- `dbInstanceClass` is not an enum, so invalid class names still pass admission and fail during reconcile.
+- `s3BackupConfig.endpoint`, `bucket`, and `secretRef` are required but can still be empty strings.
+- `masterUserPasswordRef.name` and `key` are required but can still be empty strings.
+- `staticNetwork.nameservers` validates item count but not each item as an IP.
+- Cross-field rules still need a webhook or CEL, such as password-mode mutual exclusion and post-create immutability.
+
+### Documentation is more honest
+
+The repo now has:
+
+- a useful `README.md`
+- a `DEFERRED.md` backlog for known reserved or missing features
+- generated CRD descriptions that explicitly mark several fields as `NOT YET IMPLEMENTED`
+
+Remaining doc drift:
+
+- `USAGE.md` still shows `manageMasterUserPassword: true` as if it is operational.
+- `USAGE.md` still says `TeardownAll` ignores errors.
+- `ARCHITECTURE.md` still lists `status.resources` without `metricsServiceName` in at least one table.
+
+## Remaining Main Findings
+
+### 1. Credential API is still reserved, not implemented
+
+The CRD still exposes:
+
+- `manageMasterUserPassword`
+- `masterUserPasswordRef`
+
+The controller still always generates a random admin password in `CreatePostgresVM` and stores it in the generated credentials Secret. It never reads a caller-provided Secret.
 
 Impact:
 
 - Callers cannot supply their own master password.
-- The API advertises a credential-control model that does not exist.
-- Security-sensitive behavior is hidden behind a misleading field contract.
+- This is now better documented, but it is still a real functional gap.
 
 Recommended fix:
 
-- Either implement both modes and validate their mutual exclusivity, or remove the unused fields until they are supported.
+- Implement the SecretRef path and cross-field validation, or keep the fields explicitly reserved in every user-facing doc.
 
-### 2. `engineVersion` is a no-op
+### 2. `engineVersion` remains a no-op
 
-`engineVersion` is documented as the PostgreSQL major version, but cloud-init runs:
+Cloud-init still installs:
 
 ```sh
 apt-get install -y postgresql postgresql-contrib jq qemu-guest-agent
 ```
 
-That installs whatever PostgreSQL version the chosen OS image and apt repository provide. The requested `engineVersion` never reaches package selection, image selection, or configuration.
+The requested `engineVersion` does not drive package selection, image selection, or configuration.
 
 Impact:
 
-- A user can request PostgreSQL 16 and get a different version.
-- Version selection looks supported in the CRD but is not enforced.
+- The actual PostgreSQL version is determined by the OS image and apt repositories.
+- The field is now documented as reserved, but users can still set it.
 
 Recommended fix:
 
-- Make the field real by installing versioned packages or mapping versions to images.
-- Otherwise remove it from `v1alpha1` or document it as reserved.
+- Install versioned packages or map `engineVersion` to an image/version strategy.
 
-### 3. Backup fields are not operational backups
+### 3. Backup fields remain non-operational
 
-The controller passes backup-related values into `VMCreateParams`, but the actual bootstrap only writes S3 values into `/etc/dbaas/bootstrap.env`. There is no observed installation or configuration of pgBackRest, no cron/systemd timer, no retention enforcement, and no restore/status model.
+The controller still only writes S3-related values into bootstrap env text. There is no observed:
+
+- pgBackRest installation
+- backup schedule
+- retention enforcement
+- restore path
+- backup status
 
 Impact:
 
-- `backupRetentionPeriod`, `preferredBackupWindow`, and `s3BackupConfig` imply backup behavior that is not implemented.
-- Gateway PATCH allows backup fields to change, but modify reconciliation does not apply backup configuration to an existing VM.
+- Backup configuration remains declarative metadata, not working backup behavior.
 
 Recommended fix:
 
-- Treat backup as unsupported until pgBackRest installation, scheduling, retention, status, and failure handling are implemented.
-- Add status fields or conditions for backup readiness if backups become part of the contract.
+- Keep backup fields documented as reserved until pgBackRest and status support exist.
 
-### 4. Monitoring is structurally incomplete
+### 4. Monitoring resources exist, but the exporter still does not
 
-`DeployMonitoring` creates:
-
-- Service `pg-<name>-metrics`
-- ServiceMonitor `pg-<name>-monitor`
-
-But the VM bootstrap does not install or start `postgres_exporter`, and there is no evidence that anything listens on guest port `9187`. The `DeployMonitoring` function also accepts `vmAddr` and `pgPort` but does not use them.
-
-There is a cleanup bug as well: `TeardownAll` deletes the ServiceMonitor, VM, data DataVolume, and Secret, but it does not delete the metrics Service. `ResourceRefs` has a field for `serviceMonitor` but no field for the metrics Service name.
+`DeployMonitoring` now correctly tracks both Service and ServiceMonitor for cleanup. However, the VM bootstrap still does not install or start `postgres_exporter`, and nothing in the VM is shown listening on port `9187`.
 
 Impact:
 
-- Monitoring may report as deployed even if no metrics endpoint exists.
-- Metrics Services can be leaked after DBInstance deletion.
-- `status.prometheusTarget` can point at a target that is not actually scrapeable.
+- `status.prometheusTarget` can still point to a closed scrape target.
+- Monitoring can appear deployed structurally while no metrics are actually served.
 
 Recommended fix:
 
-- Install and configure a real exporter, or remove per-instance monitoring from the ready path.
-- Track the metrics Service in status and delete it during finalizer cleanup.
-- Add reconciliation tests for monitoring resource creation and cleanup.
+- Install and configure `postgres_exporter` or equivalent during bootstrap.
+- Use the existing `exporter_password` credential intentionally.
+- Add a readiness/status signal for monitoring.
 
-### 5. Modify semantics overstate what is applied
+### 5. `status.conditions` and `status.readReplicas` are still unused
 
-Any spec generation change on an available instance triggers `reconcileModify`. That method only:
+The CRD declares standard `metav1.Condition` status, but the reconciler still writes only:
 
-- resizes VM CPU/memory from `dbInstanceClass`
-- resizes the data DataVolume from `allocatedStorage`
-
-It then sets `status.observedGeneration = metadata.generation` and reports "Modifications applied".
+- `phase`
+- `provisioningPhase`
+- `message`
+- `resources`
+- `endpoint`
+- selected metadata fields
 
 Impact:
 
-- Changes to fields like `backupRetentionPeriod`, `preferredBackupWindow`, `engineVersion`, `dbName`, `port`, `storageType`, `osImage`, `staticNetwork`, `vmPassword`, or `tags` can be marked observed even though they were not applied.
-- Consumers may treat `observedGeneration` as proof that the full spec has been reconciled, which is not true.
+- `kubectl wait --for=condition=Ready dbi/...` will not work.
+- Other controllers and dashboards cannot use condition-based readiness.
 
 Recommended fix:
 
-- Detect which fields changed and only mark a generation observed when all supported changes are applied.
-- Reject or clearly report unsupported mutable fields.
-- Define immutable fields explicitly in docs and, ideally, with validation/webhooks.
+- Write conditions for at least `Ready`, `StorageReady`, `VMReady`, `DatabaseReady`, and `MonitoringReady`.
 
-### 6. Finalizer cleanup is incomplete and too forgiving
+### 6. Network existence is still not verified
 
-`reconcileDelete` delegates to `TeardownAll`, and `TeardownAll` ignores all delete errors. The finalizer is removed regardless of whether child resource deletion succeeded.
-
-Known cleanup gaps:
-
-- Metrics Service is not deleted.
-- Service name is not tracked in status.
-- Delete errors are swallowed.
-- The OS DataVolume created through VM `dataVolumeTemplates` is not explicitly tracked; it may rely on KubeVirt ownership behavior rather than the DBaaS status model.
+`networkRef` now has a `namespace/name` pattern, but `phaseNetwork` still does not check whether the referenced Multus NAD exists.
 
 Impact:
 
-- Orphaned resources can remain after the CR disappears.
-- The controller cannot surface cleanup failures to users.
+- A typo can still advance through `NetworkProvisioned`.
+- The real failure appears later during VM networking or readiness.
 
 Recommended fix:
 
-- Track every created resource in `status.resources`.
-- Return aggregate delete errors from `TeardownAll`.
-- Keep the finalizer until required resources are gone or not found.
+- Parse `networkRef` and `Get` the NAD during `phaseNetwork`.
+- Add RBAC for `network-attachment-definitions`.
 
-### 7. CRD validation is too weak
+### 7. Tests remain thin around real reconciler behavior
 
-The generated CRD validates required fields, nested object required fields, and `running` defaulting. It does not validate most semantic constraints.
+The code now has more behavior that deserves tests, especially:
 
-Missing validation examples:
-
-- `allocatedStorage` minimum and possibly maximum.
-- `port` range `1-65535`.
-- `dbInstanceClass` enum from the supported class catalog.
-- `networkRef` shape, such as `namespace/name`.
-- `preferredBackupWindow` pattern.
-- `staticNetwork.address` CIDR format.
-- `staticNetwork.gateway` IP format.
-- `staticNetwork.nameservers` minimum item count and IP format.
-- `s3BackupConfig.endpoint`, `bucket`, and `secretRef` non-empty strings.
-- `masterUserPasswordRef.name` and `key` non-empty strings.
+- `AppliedSpec` snapshot and `immutableDrift`
+- defaulted optional fields during modify
+- immutable change refusal
+- resize-only modify path
+- `MetricsServiceName` tracking
+- `TeardownAll` aggregate errors
+- validation markers in generated CRD
+- reserved credential and backup behavior
 
 Impact:
 
-- Invalid objects are accepted by the API server.
-- Users get late reconcile failures instead of admission-time feedback.
+- The new modify-path bug is the kind of regression tests should catch.
 
 Recommended fix:
 
-- Add Kubebuilder validation markers and regenerate manifests.
-- Consider CEL validations or webhooks for cross-field rules.
+- Add focused unit tests for `immutableDrift`.
+- Add reconciler tests around create defaults followed by resize.
+- Add Harvester client object-construction tests for monitoring and teardown.
 
-### 8. Network reference is not verified
+## Highest-Priority Current Issues
 
-The controller only checks `spec.networkRef == ""`. It does not:
+1. Fix `AppliedSpec` default normalization.
+   - This directly affects legitimate day-2 operations after create.
 
-- parse `namespace/name`
-- verify the referenced NAD exists
-- verify the VLAN has egress
+2. Add tests for modify behavior.
+   - Cover defaulted create fields followed by mutable resize/deletion-protection patches.
 
-Impact:
+3. Keep `USAGE.md` aligned with reserved features.
+   - Especially password management and teardown behavior.
 
-- The resource can move past the network phase with a bad reference.
-- The eventual failure is pushed into VM creation or cloud-init readiness.
+4. Decide whether to install a real exporter or downgrade monitoring status.
+   - ServiceMonitor without an exporter is operationally misleading.
 
-Recommended fix:
-
-- Validate shape at admission.
-- Optionally check NAD existence during reconciliation before marking network provisioned.
-
-### 9. Status fields are underused
-
-`status.conditions` is defined using `metav1.Condition`, but the reconciler does not write conditions. It relies on:
-
-- `status.phase`
-- `status.provisioningPhase`
-- `status.message`
-- `status.resources`
-- `status.endpoint`
-
-`status.readReplicas` is also declared but unused.
-
-Impact:
-
-- Standard condition-based consumers cannot reliably watch readiness or failures.
-- The status contract is larger than the actual behavior.
-
-Recommended fix:
-
-- Either implement conditions such as `Ready`, `StorageReady`, `VMReady`, `DatabaseReady`, `MonitoringReady`, and `BackupReady`, or remove the field until it is meaningful.
-
-### 10. Tests do not cover the real reconciler behavior
-
-The controller test only verifies that the first reconcile can add a finalizer without Harvester calls. The gateway tests cover HTTP routing and CR mutations, but they do not prove that controller reconciliation applies those mutations correctly.
-
-Gaps:
-
-- no test for invalid instance classes
-- no test for storage creation fields
-- no test for VM creation parameters
-- no test for unsupported spec mutations
-- no test for deletion protection
-- no test for cleanup completeness
-- no test proving credentials modes
-- no test proving backup or monitoring behavior
-
-Impact:
-
-- The highest-risk API mismatches can regress or remain hidden.
-
-Recommended fix:
-
-- Add unit tests around the Harvester client object construction.
-- Add reconciler tests for phase transitions and cleanup.
-- Add negative tests for unsupported or invalid spec changes.
-
-### 11. Documentation drift is visible
-
-Examples:
-
-- Code comments say `backupRetentionPeriod` default is 7, but the implementation default is zero.
-- Architecture docs describe pgBackRest and postgres_exporter concepts that are not implemented in bootstrap.
-- `README.md` is still mostly Kubebuilder scaffold text.
-- Docs say teardown removes the metrics Service, but code does not.
-
-Impact:
-
-- Users cannot infer actual behavior from the docs.
-- Operational expectations around backup, monitoring, and cleanup are especially likely to be wrong.
-
-Recommended fix:
-
-- Update docs to separate implemented, partial, and planned features.
-- Keep generated CRD descriptions aligned with actual behavior.
+5. Implement or keep deferring credential, backup, and engine-version features.
+   - The current code documents them as reserved, which is acceptable for `v1alpha1` if consistently communicated.
 
 ## Strengths
 
-- The phase state machine is easy to follow.
+- The phase state machine is still easy to follow.
 - Resource names are deterministic.
-- Status tracks key child resource names for idempotency.
-- Start/stop via `spec.running` is simple and fits Kubernetes desired-state style.
+- Status now tracks more cleanup-relevant resources.
+- Finalizer behavior is safer after teardown error aggregation.
 - Static networking is handled at the correct cloud-init stage through `networkdata`.
 - Per-instance TLS and CA publication are useful for client verification.
-- The in-code instance class catalog gives a clear sizing policy.
-
-## Recommended Priority Order
-
-1. Fix the credentials contract.
-   - Implement `masterUserPasswordRef` or remove it.
-   - Make `manageMasterUserPassword` meaningful or remove it.
-
-2. Correct cleanup.
-   - Track and delete the metrics Service.
-   - Stop swallowing deletion errors.
-   - Keep finalizers until required cleanup completes.
-
-3. Decide which fields are actually supported.
-   - Mark unsupported fields as reserved in docs or remove them from the API.
-   - Define immutable fields clearly.
-
-4. Tighten modify behavior.
-   - Apply only supported changes.
-   - Do not advance `observedGeneration` for unsupported changes.
-
-5. Add CRD validation.
-   - Enforce ranges, patterns, enums, and non-empty strings.
-   - Add cross-field validation for password and backup modes if those modes are retained.
-
-6. Make backup and monitoring real or downgrade them.
-   - For backup: install/configure pgBackRest, schedule backups, expose status.
-   - For monitoring: install/export metrics and verify ServiceMonitor target behavior.
-
-7. Improve tests.
-   - Cover reconcile phases, resource construction, finalizer cleanup, and unsupported mutations.
-
-8. Refresh documentation.
-   - Replace scaffold README content.
-   - Align architecture and usage docs with implemented behavior.
+- The new `DEFERRED.md` gives a practical backlog for known reserved features.
+- Generated CRD docs now communicate implementation limits much better than before.
 
 ## Bottom Line
 
-The `DBInstance` CRD has a workable foundation for provisioning PostgreSQL VMs on Harvester, but it currently advertises more than it delivers. The operator should either implement the exposed contract or narrow the API to what is actually supported. The most important fixes are credentials, cleanup, validation, modify semantics, and the backup/monitoring claims.
+The CRD/operator is now more honest and safer than the previous snapshot. The biggest previous cleanup and silent-modify issues were partially addressed. The remaining critical fix is to correct `AppliedSpec` drift comparison so valid mutable updates do not fail when optional create-time fields were omitted. After that, the main work is implementing or continuing to explicitly defer credentials, engine versioning, backups, exporter-based monitoring, status conditions, and real reconciler tests.
