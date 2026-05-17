@@ -207,7 +207,6 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 	adminPw := randomString(32)
 	replPw := randomString(32)
 	exporterPw := randomString(24)
-	luksKey := randomString(64)
 
 	// Generate per-instance TLS: ephemeral CA + server cert signed by that CA.
 	// CA key is stored in the Secret alongside DB credentials (same threat model).
@@ -225,7 +224,7 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 	// that systemd-networkd sees the right IP/gateway/DNS *before* it
 	// times out (which is what bit us when we tried writing the netplan
 	// via cloud-init's write_files module instead).
-	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, luksKey, tls)
+	cloudInit := buildCloudInit(p, adminPw, replPw, exporterPw, tls)
 	networkData := buildNetworkData(p)
 	secret := newUnstructured("v1", "Secret", secretName, p.Namespace)
 	_ = unstructured.SetNestedField(secret.Object, "Opaque", "type")
@@ -234,7 +233,6 @@ func (c *Client) CreatePostgresVM(ctx context.Context, p VMCreateParams) (vmName
 		"admin_password":    adminPw,
 		"repl_password":     replPw,
 		"exporter_password": exporterPw,
-		"luks_key":          luksKey,
 		"ca_cert":           tls.CACertPEM,
 		"ca_key":            tls.CAKeyPEM,
 		"server_cert":       tls.ServerCertPEM,

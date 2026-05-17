@@ -67,7 +67,7 @@ ethernets:
 	)
 }
 
-func buildCloudInit(p VMCreateParams, adminPw, replPw, exporterPw, luksKey string, tls *TLSBundle) string {
+func buildCloudInit(p VMCreateParams, adminPw, replPw, exporterPw string, tls *TLSBundle) string {
 	backupConfig := "# backups disabled"
 	if p.BackupEnabled && p.S3Config != nil {
 		backupConfig = fmt.Sprintf(
@@ -111,7 +111,6 @@ ssh_pwauth: true
       REPL_PASSWORD=%s
       EXPORTER_PASSWORD=%s
       MAX_CONNECTIONS=%d
-      LUKS_KEY=%s
       %s
   - path: /etc/ssl/certs/pg-ca.crt
     encoding: b64
@@ -178,6 +177,12 @@ ssh_pwauth: true
       SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${MASTER_USER}'
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
       EOSQL
+
+      # Wipe the on-disk copy of the secrets now that PostgreSQL is
+      # configured. The K8s Secret stays as the source of truth; leaving
+      # bootstrap.env around lets anyone with root inside the VM (or
+      # anyone who restores from a snapshot) read the admin password.
+      shred -uz /etc/dbaas/bootstrap.env 2>/dev/null || rm -f /etc/dbaas/bootstrap.env
 runcmd:
   - mkdir -p /var/lib/dbaas
   - chown root:root /var/lib/dbaas
@@ -193,7 +198,6 @@ final_message: "DBaaS bootstrap complete for %s"
 		replPw,
 		exporterPw,
 		p.MaxConnections,
-		luksKey,
 		backupConfig,
 		caCertB64,
 		serverCertB64,
