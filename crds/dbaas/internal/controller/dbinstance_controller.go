@@ -53,7 +53,7 @@ type DBInstanceReconciler struct {
 // +kubebuilder:rbac:groups=harvesterhci.io,resources=virtualmachineimages,verbs=get;list
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=create
+// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete
 
 // Reconcile is the main entry point called by controller-runtime.
 func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -203,6 +203,10 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 	if osImage == "" {
 		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
 	}
+	storageType := inst.Spec.StorageType
+	if storageType == "" {
+		storageType = "longhorn"
+	}
 
 	vmName, secretName, caCertPEM, err := r.Harvester.CreatePostgresVM(ctx, harvester.VMCreateParams{
 		ID:             id,
@@ -243,8 +247,8 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 		DBName:         dbName,
 		MasterUsername: masterUser,
 		EngineVersion:  inst.Spec.EngineVersion,
-		Port:           inst.Spec.Port,
-		StorageType:    inst.Spec.StorageType,
+		Port:           specPort(inst.Spec.Port),
+		StorageType:    storageType,
 	}
 	inst.Status.ProvisioningPhase = dbaasv1.PhaseVMCreated
 	inst.Status.Message = "VM created, waiting for PostgreSQL to initialize"
@@ -430,26 +434,65 @@ func immutableDrift(inst *dbaasv1.DBInstance) string {
 	if a == nil {
 		return ""
 	}
+	osImage := inst.Spec.OSImage
+	if osImage == "" {
+		osImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+	}
+	dbName := inst.Spec.DBName
+	if dbName == "" {
+		dbName = inst.Name
+	}
+	masterUser := inst.Spec.MasterUsername
+	if masterUser == "" {
+		masterUser = "dbadmin"
+	}
+	port := specPort(inst.Spec.Port)
+	storageType := inst.Spec.StorageType
+	if storageType == "" {
+		storageType = "longhorn"
+	}
+
+	appliedOSImage := a.OSImage
+	if appliedOSImage == "" {
+		appliedOSImage = "ubuntu-22.04-server-cloudimg-amd64.img"
+	}
+	appliedDBName := a.DBName
+	if appliedDBName == "" {
+		appliedDBName = inst.Name
+	}
+	appliedMasterUser := a.MasterUsername
+	if appliedMasterUser == "" {
+		appliedMasterUser = "dbadmin"
+	}
+	appliedPort := a.Port
+	if appliedPort == 0 {
+		appliedPort = 5432
+	}
+	appliedStorageType := a.StorageType
+	if appliedStorageType == "" {
+		appliedStorageType = "longhorn"
+	}
+
 	var changed []string
 	if a.NetworkRef != inst.Spec.NetworkRef {
 		changed = append(changed, "networkRef")
 	}
-	if a.OSImage != inst.Spec.OSImage {
+	if appliedOSImage != osImage {
 		changed = append(changed, "osImage")
 	}
-	if a.DBName != inst.Spec.DBName {
+	if appliedDBName != dbName {
 		changed = append(changed, "dbName")
 	}
-	if a.MasterUsername != inst.Spec.MasterUsername {
+	if appliedMasterUser != masterUser {
 		changed = append(changed, "masterUsername")
 	}
 	if a.EngineVersion != inst.Spec.EngineVersion {
 		changed = append(changed, "engineVersion")
 	}
-	if a.Port != inst.Spec.Port {
+	if appliedPort != port {
 		changed = append(changed, "port")
 	}
-	if a.StorageType != inst.Spec.StorageType {
+	if appliedStorageType != storageType {
 		changed = append(changed, "storageType")
 	}
 	return strings.Join(changed, ",")

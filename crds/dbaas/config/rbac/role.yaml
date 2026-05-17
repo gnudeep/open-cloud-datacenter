@@ -18,6 +18,7 @@ rules:
   - services
   verbs:
   - create
+  - delete
 - apiGroups:
   - cdi.kubevirt.io
   resources:

@@ -439,7 +439,9 @@ func (c *Client) DeployMonitoring(ctx context.Context, id, ns string) (svcName, 
 	_ = unstructured.SetNestedSlice(svc.Object, []interface{}{
 		map[string]interface{}{"name": "metrics", "port": int64(9187), "targetPort": int64(9187), "protocol": "TCP"},
 	}, "spec", "ports")
-	_, _ = c.Dynamic.Resource(serviceGVR).Namespace(ns).Create(ctx, svc, metav1.CreateOptions{})
+	if _, err = c.Dynamic.Resource(serviceGVR).Namespace(ns).Create(ctx, svc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return
+	}
 
 	// ServiceMonitor
 	sm := newUnstructured("monitoring.coreos.com/v1", "ServiceMonitor", smName, ns)
@@ -450,7 +452,9 @@ func (c *Client) DeployMonitoring(ctx context.Context, id, ns string) (svcName, 
 	_ = unstructured.SetNestedSlice(sm.Object, []interface{}{
 		map[string]interface{}{"port": "metrics", "interval": "15s", "path": "/metrics"},
 	}, "spec", "endpoints")
-	_, err = c.Dynamic.Resource(smGVR).Namespace(ns).Create(ctx, sm, metav1.CreateOptions{})
+	if _, err = c.Dynamic.Resource(smGVR).Namespace(ns).Create(ctx, sm, metav1.CreateOptions{}); apierrors.IsAlreadyExists(err) {
+		err = nil
+	}
 
 	return
 }
