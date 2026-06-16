@@ -20,6 +20,8 @@ import (
 	"context"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic/fake"
 )
@@ -28,7 +30,7 @@ func TestDeployMonitoringIsIdempotent(t *testing.T) {
 	client := NewClient(fake.NewSimpleDynamicClient(runtime.NewScheme()), "https://grafana.example")
 
 	for i := 0; i < 2; i++ {
-		svcName, smName, grafanaURL, promTarget, err := client.DeployMonitoring(context.Background(), "orders", "tenant-a")
+		svcName, smName, grafanaURL, promTarget, err := client.DeployMonitoring(context.Background(), "orders", "tenant-a", "192.168.40.50")
 		if err != nil {
 			t.Fatalf("DeployMonitoring call %d returned error: %v", i+1, err)
 		}
@@ -44,5 +46,28 @@ func TestDeployMonitoringIsIdempotent(t *testing.T) {
 		if promTarget != "pg-orders-metrics.tenant-a.svc:9187" {
 			t.Fatalf("Prometheus target = %q", promTarget)
 		}
+	}
+
+	svc, err := client.Dynamic.Resource(serviceGVR).Namespace("tenant-a").Get(context.Background(), "pg-orders-metrics", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get Service: %v", err)
+	}
+	if selector, found, err := unstructured.NestedMap(svc.Object, "spec", "selector"); err != nil || found || len(selector) != 0 {
+		t.Fatalf("Service selector = %v, found=%t, err=%v; want no selector", selector, found, err)
+	}
+
+	ep, err := client.Dynamic.Resource(endpointsGVR).Namespace("tenant-a").Get(context.Background(), "pg-orders-metrics", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get Endpoints: %v", err)
+	}
+	subsets, found, err := unstructured.NestedSlice(ep.Object, "subsets")
+	if err != nil || !found || len(subsets) != 1 {
+		t.Fatalf("Endpoint subsets = %v, found=%t, err=%v", subsets, found, err)
+	}
+	subset := subsets[0].(map[string]interface{})
+	addresses := subset["addresses"].([]interface{})
+	address := addresses[0].(map[string]interface{})
+	if address["ip"] != "192.168.40.50" {
+		t.Fatalf("Endpoint IP = %v, want 192.168.40.50", address["ip"])
 	}
 }

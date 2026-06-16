@@ -7,18 +7,22 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - endpoints
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
   - secrets
   verbs:
   - create
   - delete
   - get
-- apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - create
-  - delete
 - apiGroups:
   - cdi.kubevirt.io
   resources:
@@ -83,3 +87,5 @@ rules:
   verbs:
   - create
   - delete
+  - get
+  - update

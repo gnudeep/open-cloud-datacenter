@@ -34,6 +34,13 @@ import (
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/harvester"
 )
 
+// probeListener is the function phaseWaitReady calls to confirm postgres
+// is actually accepting TCP before marking the instance DatabaseReady.
+// Package-level var so tests can stub it without running real Pods.
+var probeListener = func(c *harvester.Client, ctx context.Context, ns, vmName, nadRef, ip string, port int, sn *dbaasv1.NetworkConfig) error {
+	return c.ProbeVMListener(ctx, ns, vmName, nadRef, ip, port, sn)
+}
+
 // Controller-side defaults for fields the user can leave blank on the
 // DBInstance spec. Centralised here so phaseStorage, phaseVM, and
 // immutableDrift can't drift apart over time. A change here should be
@@ -63,9 +70,11 @@ type DBInstanceReconciler struct {
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups=harvesterhci.io,resources=virtualmachineimages,verbs=get;list
-// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups="",resources=endpoints,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;create;delete
 
 // Reconcile is the main entry point called by controller-runtime.
 func (r *DBInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -271,10 +280,7 @@ func (r *DBInstanceReconciler) phaseVM(ctx context.Context, inst *dbaasv1.DBInst
 func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1.DBInstance) (ctrl.Result, error) {
 	ns := inst.Namespace
 
-	// VMI's status.interfaces[].ipAddress is populated by qemu-guest-agent.
-	// Our bootstrap.sh enables the agent only AFTER `apt install postgresql`
-	// has finished and the server is restarted, so the IP appearing here is
-	// a stricter signal than a wall-clock uptime heuristic ever was.
+	// First gate: VMI is Running and the qemu-guest-agent has reported an IP.
 	readiness, err := r.Harvester.GetVMIReadiness(ctx, ns, inst.Status.Resources.VMName)
 	if err != nil || !readiness.Running || readiness.IP == "" {
 		inst.Status.Message = "Waiting for VM to become ready"
@@ -287,6 +293,27 @@ func (r *DBInstanceReconciler) phaseWaitReady(ctx context.Context, inst *dbaasv1
 	dbName := inst.Spec.DBName
 	if dbName == "" {
 		dbName = inst.Name
+	}
+
+	// Second gate: PostgreSQL is actually accepting TCP connections on its
+	// listener. The guest-agent IP alone is too weak — the agent starts as
+	// soon as `apt install` finishes, well before bootstrap.sh has moved
+	// pgdata onto the dedicated disk, restarted postgres, and created the
+	// admin role. A pure VMI-readiness gate has previously let a broken
+	// postgres slip through as "available".
+	//
+	// The probe runs from a one-shot Pod attached to the same Multus NAD
+	// as the VM (see harvester.ProbeVMListener for why). TCP-only — not a
+	// SQL ping — keeps the controller free of a DB driver dependency;
+	// postgres opens its listener only when it is genuinely ready to
+	// accept SQL, so a successful dial is a sufficient signal.
+	if derr := probeListener(r.Harvester, ctx, ns, inst.Status.Resources.VMName,
+		inst.Status.Resources.NADName, readiness.IP, port, inst.Spec.StaticNetwork); derr != nil {
+		inst.Status.Message = fmt.Sprintf("Waiting for PostgreSQL listener at %s:%d: %v",
+			readiness.IP, port, derr)
+		inst.Status.ProvisioningPhase = dbaasv1.PhaseWaitingForCloudInit
+		_ = r.statusUpdate(ctx, inst)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	inst.Status.Endpoint = &dbaasv1.Endpoint{
@@ -309,7 +336,12 @@ func (r *DBInstanceReconciler) phaseMonitoring(ctx context.Context, inst *dbaasv
 	id := inst.Name
 	ns := inst.Namespace
 
-	svcName, smName, grafanaURL, promTarget, err := r.Harvester.DeployMonitoring(ctx, id, ns)
+	if inst.Status.Endpoint == nil || inst.Status.Endpoint.Address == "" {
+		inst.Status.Message = "Waiting for database endpoint before monitoring setup"
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, r.statusUpdate(ctx, inst)
+	}
+
+	svcName, smName, grafanaURL, promTarget, err := r.Harvester.DeployMonitoring(ctx, id, ns, inst.Status.Endpoint.Address)
 	if err != nil {
 		// Non-fatal — DB works without monitoring. Track the Service name
 		// regardless: DeployMonitoring creates the Service first, so a
@@ -358,6 +390,18 @@ func (r *DBInstanceReconciler) phaseAvailable(ctx context.Context, inst *dbaasv1
 			JDBCURL: fmt.Sprintf("jdbc:postgresql://%s:%d/%s?ssl=true&sslmode=verify-ca", readiness.IP, port, dbName),
 		}
 		log.FromContext(ctx).Info("endpoint updated", "ip", readiness.IP)
+	}
+
+	if inst.Status.Endpoint != nil && inst.Status.Endpoint.Address != "" {
+		svcName, smName, grafanaURL, promTarget, err := r.Harvester.DeployMonitoring(ctx, inst.Name, inst.Namespace, inst.Status.Endpoint.Address)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "monitoring refresh failed (non-fatal)")
+		} else {
+			inst.Status.Resources.MetricsServiceName = svcName
+			inst.Status.Resources.ServiceMonitor = smName
+			inst.Status.GrafanaURL = grafanaURL
+			inst.Status.PrometheusTarget = promTarget
+		}
 	}
 
 	if equality.Semantic.DeepEqual(prev, &inst.Status) {

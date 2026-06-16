@@ -136,11 +136,46 @@ ssh_pwauth: true
       #    that don't load the package module.
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y postgresql postgresql-contrib jq qemu-guest-agent
+      apt-get install -y postgresql postgresql-contrib jq qemu-guest-agent prometheus-postgres-exporter
       systemctl enable --now qemu-guest-agent
 
       PG_VER=$(pg_lsclusters -h | awk '{print $1}' | head -1)
       PG_CONF="/etc/postgresql/${PG_VER}/main"
+
+      # Move PostgreSQL data onto the dedicated pgdata disk before applying
+      # DB-specific configuration. KubeVirt presents the VM's second disk as
+      # /dev/vdb based on the VM spec's disk ordering: vda=os, vdb=pgdata,
+      # vdc=cloud-init. If the disk is already formatted/mounted, preserve it.
+      PGDATA_DEVICE="/dev/vdb"
+      PGDATA_MOUNT="/var/lib/postgresql"
+      if [ -b "${PGDATA_DEVICE}" ]; then
+        systemctl stop postgresql || true
+        if ! blkid "${PGDATA_DEVICE}" >/dev/null 2>&1; then
+          mkfs.ext4 -F -L pgdata "${PGDATA_DEVICE}"
+        fi
+        PGDATA_UUID=$(blkid -s UUID -o value "${PGDATA_DEVICE}")
+        mkdir -p /mnt/dbaas-pgdata
+        if ! findmnt -n "${PGDATA_MOUNT}" >/dev/null 2>&1; then
+          mount "${PGDATA_DEVICE}" /mnt/dbaas-pgdata
+          # Copy the freshly-apt-installed cluster onto vdb on first boot.
+          # The "is the disk a virgin cluster?" test is the absence of
+          # PostgreSQL's own marker file (PG_VERSION), not "is the dir empty?":
+          # mkfs.ext4 always creates lost+found, so a freshly-formatted disk
+          # is never literally empty. On reboot the marker exists and we keep
+          # the existing data.
+          if [ ! -f "/mnt/dbaas-pgdata/${PG_VER}/main/PG_VERSION" ] && [ -d "${PGDATA_MOUNT}/${PG_VER}/main" ]; then
+            cp -a "${PGDATA_MOUNT}/." /mnt/dbaas-pgdata/
+          fi
+          umount /mnt/dbaas-pgdata
+          if ! grep -q "UUID=${PGDATA_UUID}[[:space:]]${PGDATA_MOUNT}[[:space:]]" /etc/fstab; then
+            echo "UUID=${PGDATA_UUID} ${PGDATA_MOUNT} ext4 defaults,nofail 0 2" >> /etc/fstab
+          fi
+          mount "${PGDATA_MOUNT}"
+        fi
+        chown -R postgres:postgres "${PGDATA_MOUNT}"
+      else
+        echo "WARN: ${PGDATA_DEVICE} not found; PostgreSQL data remains on the OS disk" >&2
+      fi
 
       # Fix server key ownership now that postgres user exists
       chown postgres:postgres /etc/ssl/private/pg-server.key
@@ -173,10 +208,25 @@ ssh_pwauth: true
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MASTER_USER}') THEN
           CREATE ROLE ${MASTER_USER} LOGIN CREATEDB CREATEROLE PASSWORD '${MASTER_PASSWORD}';
         END IF;
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'postgres_exporter') THEN
+          CREATE ROLE postgres_exporter LOGIN PASSWORD '${EXPORTER_PASSWORD}';
+        END IF;
       END \$\$;
+      GRANT pg_monitor TO postgres_exporter;
       SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${MASTER_USER}'
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
       EOSQL
+
+      cat >/etc/default/prometheus-postgres-exporter <<EOEXPORTER
+      DATA_SOURCE_NAME=postgresql://postgres_exporter:${EXPORTER_PASSWORD}@127.0.0.1:${DB_PORT}/postgres?sslmode=require
+      ARGS="--web.listen-address=:9187"
+      EOEXPORTER
+      # apt's postinst starts the exporter immediately with its default
+      # (DATA_SOURCE_NAME-less) config, so 'systemctl enable --now' here is
+      # a no-op against an already-running daemon and the new env file is
+      # never read. An explicit restart is what actually picks it up.
+      systemctl enable prometheus-postgres-exporter
+      systemctl restart prometheus-postgres-exporter
 
       # Wipe the on-disk copy of the secrets now that PostgreSQL is
       # configured. The K8s Secret stays as the source of truth; leaving

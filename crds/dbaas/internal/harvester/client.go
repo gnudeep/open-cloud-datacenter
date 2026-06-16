@@ -55,6 +55,9 @@ var (
 	serviceGVR = schema.GroupVersionResource{
 		Group: "", Version: "v1", Resource: "services",
 	}
+	endpointsGVR = schema.GroupVersionResource{
+		Group: "", Version: "v1", Resource: "endpoints",
+	}
 	smGVR = schema.GroupVersionResource{
 		Group: "monitoring.coreos.com", Version: "v1", Resource: "servicemonitors",
 	}
@@ -425,27 +428,52 @@ func (c *Client) ResizeVM(ctx context.Context, ns, vmName string, cpuCores, memo
 // Monitoring
 // ============================================================
 
-// DeployMonitoring creates the headless metrics Service and a Prometheus
+// DeployMonitoring creates the headless metrics Service, its manual Endpoints,
+// and a Prometheus
 // ServiceMonitor for the instance. It returns the Service name, the
 // ServiceMonitor name, the Grafana dashboard URL, and the Prometheus
 // scrape target. The caller stores both names in status.resources so the
 // finalizer can delete them later.
-func (c *Client) DeployMonitoring(ctx context.Context, id, ns string) (svcName, smName, grafanaURL, promTarget string, err error) {
+func (c *Client) DeployMonitoring(ctx context.Context, id, ns, vmIP string) (svcName, smName, grafanaURL, promTarget string, err error) {
 	smName = fmt.Sprintf("pg-%s-monitor", id)
 	svcName = fmt.Sprintf("pg-%s-metrics", id)
 	grafanaURL = fmt.Sprintf("%s/d/dbaas-%s/postgresql-%s", c.GrafanaURL, id, id)
 	promTarget = fmt.Sprintf("%s.%s.svc:9187", svcName, ns)
+	if vmIP == "" {
+		err = fmt.Errorf("monitoring endpoint IP is required")
+		return
+	}
 
-	// Headless service
+	// Headless service. Do not use a selector: the KubeVirt virt-launcher pod
+	// has the instance label, but the exporter runs inside the VM at vmIP.
+	// A manual Endpoints object below points Prometheus at the guest address.
 	svc := newUnstructured("v1", "Service", svcName, ns)
 	svc.SetLabels(map[string]string{dbaasv1.LabelInstance: id, dbaasv1.LabelMetrics: "true"})
 	_ = unstructured.SetNestedField(svc.Object, "ClusterIP", "spec", "type")
 	_ = unstructured.SetNestedField(svc.Object, "None", "spec", "clusterIP")
-	_ = unstructured.SetNestedField(svc.Object, map[string]interface{}{dbaasv1.LabelInstance: id}, "spec", "selector")
 	_ = unstructured.SetNestedSlice(svc.Object, []interface{}{
 		map[string]interface{}{"name": "metrics", "port": int64(9187), "targetPort": int64(9187), "protocol": "TCP"},
 	}, "spec", "ports")
-	if _, err = c.Dynamic.Resource(serviceGVR).Namespace(ns).Create(ctx, svc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+	unstructured.RemoveNestedField(svc.Object, "spec", "selector")
+	if err = c.createOrUpdate(ctx, serviceGVR, ns, svc, func(existing *unstructured.Unstructured) {
+		existing.SetLabels(svc.GetLabels())
+		_ = unstructured.SetNestedField(existing.Object, "ClusterIP", "spec", "type")
+		_ = unstructured.SetNestedField(existing.Object, "None", "spec", "clusterIP")
+		_ = unstructured.SetNestedSlice(existing.Object, []interface{}{
+			map[string]interface{}{"name": "metrics", "port": int64(9187), "targetPort": int64(9187), "protocol": "TCP"},
+		}, "spec", "ports")
+		unstructured.RemoveNestedField(existing.Object, "spec", "selector")
+	}); err != nil {
+		return
+	}
+
+	ep := newUnstructured("v1", "Endpoints", svcName, ns)
+	ep.SetLabels(map[string]string{dbaasv1.LabelInstance: id, dbaasv1.LabelMetrics: "true"})
+	_ = unstructured.SetNestedSlice(ep.Object, monitoringEndpointSubsets(vmIP), "subsets")
+	if err = c.createOrUpdate(ctx, endpointsGVR, ns, ep, func(existing *unstructured.Unstructured) {
+		existing.SetLabels(ep.GetLabels())
+		_ = unstructured.SetNestedSlice(existing.Object, monitoringEndpointSubsets(vmIP), "subsets")
+	}); err != nil {
 		return
 	}
 
@@ -458,9 +486,15 @@ func (c *Client) DeployMonitoring(ctx context.Context, id, ns string) (svcName, 
 	_ = unstructured.SetNestedSlice(sm.Object, []interface{}{
 		map[string]interface{}{"port": "metrics", "interval": "15s", "path": "/metrics"},
 	}, "spec", "endpoints")
-	if _, err = c.Dynamic.Resource(smGVR).Namespace(ns).Create(ctx, sm, metav1.CreateOptions{}); apierrors.IsAlreadyExists(err) {
-		err = nil
-	}
+	err = c.createOrUpdate(ctx, smGVR, ns, sm, func(existing *unstructured.Unstructured) {
+		existing.SetLabels(sm.GetLabels())
+		_ = unstructured.SetNestedField(existing.Object, map[string]interface{}{
+			"matchLabels": map[string]interface{}{dbaasv1.LabelMetrics: "true", dbaasv1.LabelInstance: id},
+		}, "spec", "selector")
+		_ = unstructured.SetNestedSlice(existing.Object, []interface{}{
+			map[string]interface{}{"port": "metrics", "interval": "15s", "path": "/metrics"},
+		}, "spec", "endpoints")
+	})
 
 	return
 }
@@ -486,6 +520,7 @@ func (c *Client) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.Re
 	}
 	tasks := []deleteTask{
 		{smGVR, ns, refs.ServiceMonitor},
+		{endpointsGVR, ns, refs.MetricsServiceName},
 		{serviceGVR, ns, refs.MetricsServiceName},
 		{vmGVR, ns, refs.VMName},
 		{dvGVR, ns, refs.DataVolumeName},
@@ -564,6 +599,34 @@ func newUnstructured(apiVersion, kind, name, namespace string) *unstructured.Uns
 		obj.SetNamespace(namespace)
 	}
 	return obj
+}
+
+func (c *Client) createOrUpdate(ctx context.Context, gvr schema.GroupVersionResource, ns string, desired *unstructured.Unstructured, mutateExisting func(*unstructured.Unstructured)) error {
+	if _, err := c.Dynamic.Resource(gvr).Namespace(ns).Create(ctx, desired, metav1.CreateOptions{}); err == nil {
+		return nil
+	} else if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	existing, err := c.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, desired.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	mutateExisting(existing)
+	_, err = c.Dynamic.Resource(gvr).Namespace(ns).Update(ctx, existing, metav1.UpdateOptions{})
+	return err
+}
+
+func monitoringEndpointSubsets(vmIP string) []interface{} {
+	return []interface{}{
+		map[string]interface{}{
+			"addresses": []interface{}{
+				map[string]interface{}{"ip": vmIP},
+			},
+			"ports": []interface{}{
+				map[string]interface{}{"name": "metrics", "port": int64(9187), "protocol": "TCP"},
+			},
+		},
+	}
 }
 
 // ignoreAlreadyExists returns nil if err is an AlreadyExists API error, otherwise err.

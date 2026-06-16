@@ -298,6 +298,28 @@ on top of an engineer already familiar with the codebase.
   buffer.
 - **Effort:** S.
 
+### DEF-21 · Probe-pod IP collisions on shared VLANs
+
+- **Status:** Open
+- **Source:** v0.2.10 phaseWaitReady probe-pod design
+- **What:** `phaseWaitReady` confirms postgres is accepting TCP by
+  spawning a one-shot Pod attached to the same Multus NAD as the VM
+  (see `internal/harvester/probe.go`). Because the NAD has no IPAM, the
+  probe pod picks a static neighbor IP — `vmIP` ± 1 in the last octet —
+  for its secondary NIC. If two DBInstances on the same VLAN have
+  addresses that differ by exactly one (e.g., `.50` and `.51`) and their
+  probes overlap in time, one probe's IP will collide with the other
+  VM's real address, causing a transient probe failure and an extra
+  reconcile cycle (the controller will retry). Single-DBInstance or
+  well-spaced address allocations are unaffected.
+- **Done when:** Either (a) the probe pod uses an IPAM-backed NAD
+  (whereabouts / DHCP), (b) the controller allocates probe IPs from an
+  operator-supplied pool, or (c) readiness is signalled out-of-band via
+  cloud-init phone-home to the gateway, removing the L2 dependency
+  entirely.
+- **Effort:** M (option c is the architecturally cleaner path and the
+  one to invest in if probe-pod churn becomes a real concern).
+
 ## Summary table
 
 | ID | Title | Status | Effort | Source |
@@ -322,3 +344,4 @@ on top of an engineer already familiar with the codebase.
 | DEF-18 | Harvester client tests | Open | S–M | codex §10 |
 | DEF-19 | Pre-baked PostgreSQL OS image | Open | M | session |
 | DEF-20 | Smaller OS disk | Open | S | timing |
+| DEF-21 | Probe-pod IP collisions on shared VLAN | Open | M | session |
