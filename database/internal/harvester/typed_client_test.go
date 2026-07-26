@@ -19,6 +19,7 @@ import (
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	cdifake "kubevirt.io/client-go/containerizeddataimporter/fake"
 	kvfake "kubevirt.io/client-go/kubevirt/fake"
 )
 
@@ -241,8 +242,8 @@ func TestTypedCreatePostgresVMPreservesVMShape(t *testing.T) {
 	if osTemplate == nil {
 		t.Fatalf("OS PVC template not found")
 	}
-	if got := osTemplate.Annotations["harvesterhci.io/imageId"]; got != "default/ubuntu-22.04" {
-		t.Fatalf("OS image annotation = %q, want default/ubuntu-22.04", got)
+	if got := osTemplate.Annotations["harvesterhci.io/imageId"]; got != "default/ubuntu-2204-postgres-v20260615" {
+		t.Fatalf("OS image annotation = %q, want default/ubuntu-2204-postgres-v20260615", got)
 	}
 	dataTemplate := findPVCTemplate(templates, "pg-orders-data")
 	if dataTemplate == nil {
@@ -526,6 +527,63 @@ func TestTypedTeardownDeletesConnectionSecretAndIgnoresNotFound(t *testing.T) {
 	}
 }
 
+func TestTypedPrepareCloudInitForRepaveRecreatesSecretAndReattachesDisk(t *testing.T) {
+	ctx := context.Background()
+	client := newTestTypedClient(testTypedVMImage())
+	params := testVMCreateParams()
+
+	vmName, credName, ciName, _, err := client.CreatePostgresVM(ctx, params)
+	if err != nil {
+		t.Fatalf("CreatePostgresVM returned error: %v", err)
+	}
+	if err := client.RemoveCloudInitDisk(ctx, params.Namespace, vmName); err != nil {
+		t.Fatalf("RemoveCloudInitDisk returned error: %v", err)
+	}
+	if err := client.DeleteSecret(ctx, params.Namespace, ciName); err != nil {
+		t.Fatalf("DeleteSecret returned error: %v", err)
+	}
+
+	if err := client.PrepareCloudInitForRepave(ctx, params, vmName, credName, ciName); err != nil {
+		t.Fatalf("PrepareCloudInitForRepave returned error: %v", err)
+	}
+
+	secret, err := client.KubeClient.CoreV1().Secrets(params.Namespace).Get(ctx, ciName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cloud-init Secret was not recreated: %v", err)
+	}
+	userdata := secret.StringData["userdata"]
+	if userdata == "" {
+		userdata = string(secret.Data["userdata"])
+	}
+	if !strings.Contains(userdata, "ENGINE_VERSION="+params.EngineVersion) {
+		t.Fatalf("cloud-init userdata does not contain requested engine version: %q", userdata)
+	}
+
+	vm, err := client.Clientset.KubevirtV1().VirtualMachines(params.Namespace).Get(ctx, vmName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get VM after repave prep: %v", err)
+	}
+	hasDisk := false
+	for _, disk := range vm.Spec.Template.Spec.Domain.Devices.Disks {
+		hasDisk = hasDisk || disk.Name == "cloudinit"
+	}
+	if !hasDisk {
+		t.Fatalf("cloudinit disk was not reattached")
+	}
+	for _, volume := range vm.Spec.Template.Spec.Volumes {
+		if volume.Name != "cloudinit" {
+			continue
+		}
+		source := volume.CloudInitNoCloud
+		if source == nil || source.UserDataSecretRef == nil || source.UserDataSecretRef.Name != ciName ||
+			source.NetworkDataSecretRef == nil || source.NetworkDataSecretRef.Name != ciName {
+			t.Fatalf("cloudinit volume source = %#v, want secret refs to %q", source, ciName)
+		}
+		return
+	}
+	t.Fatalf("cloudinit volume was not reattached")
+}
+
 func TestTypedTeardownAggregatesDeleteErrors(t *testing.T) {
 	ctx := context.Background()
 	client := newTestTypedClient(&kubevirtv1.VirtualMachine{
@@ -545,8 +603,89 @@ func TestTypedTeardownAggregatesDeleteErrors(t *testing.T) {
 	}
 }
 
+// TestTypedCollectDiskPVCNamesDoesNotCollideAcrossInstances is a regression
+// test for a real prefix-matching bug: instance "orders" and a separate,
+// legitimately-named instance "orders-os" produce nested prefixes of each
+// other ("pg-orders-os" is itself a prefix of "orders-os"'s own disk
+// "pg-orders-os-os"). Tearing down "orders" via the old namespace-wide
+// isOSDiskName scan would also match and delete "orders-os"'s disk. This
+// must not happen once status.resources.osDiskPVCName is populated — that
+// exact name should be used instead of any prefix scan.
+func TestTypedCollectDiskPVCNamesDoesNotCollideAcrossInstances(t *testing.T) {
+	ctx := context.Background()
+	client := NewTypedClientWithClientsets(
+		harvesterfake.NewSimpleClientset(), // no VM object: simulates a teardown retry after the VM is already gone
+		kubefake.NewSimpleClientset(
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pg-orders-os", Namespace: "tenant-a"}},
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pg-orders-data", Namespace: "tenant-a"}},
+			// Belongs to a DIFFERENT, coexisting instance named "orders-os" — must survive "orders"'s teardown.
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pg-orders-os-os", Namespace: "tenant-a"}},
+		),
+		kvfake.NewSimpleClientset(),
+		cdifake.NewSimpleClientset(),
+		"",
+	)
+
+	refs := dbaasv1.ResourceRefs{
+		VMName:         "pg-orders",
+		OSDiskPVCName:  "pg-orders-os",
+		DataVolumeName: "pg-orders-data",
+	}
+	names := client.collectDiskPVCNames(ctx, "orders", "tenant-a", refs)
+
+	for _, foreign := range []string{"pg-orders-os-os"} {
+		for _, n := range names {
+			if n == foreign {
+				t.Fatalf("collectDiskPVCNames(%v) = %v, must not include foreign instance's disk %q", refs, names, foreign)
+			}
+		}
+	}
+	want := map[string]bool{"pg-orders-os": true, "pg-orders-data": true}
+	for _, n := range names {
+		if !want[n] {
+			t.Fatalf("collectDiskPVCNames(%v) = %v, unexpected entry %q", refs, names, n)
+		}
+		delete(want, n)
+	}
+	if len(want) > 0 {
+		t.Fatalf("collectDiskPVCNames(%v) = %v, missing expected entries %v", refs, names, want)
+	}
+}
+
+// TestTypedCollectDiskPVCNamesFallsBackForPreFixOrphans confirms the legacy
+// scan still finds an orphaned OS disk when neither the live VM nor
+// status.resources.osDiskPVCName is available — i.e. an instance torn down
+// mid-teardown before this field existed. This path is scoped narrowly
+// (see collectDiskPVCNames doc comment) but must still work, or pre-fix
+// orphans would leak instead of being cleaned up.
+func TestTypedCollectDiskPVCNamesFallsBackForPreFixOrphans(t *testing.T) {
+	ctx := context.Background()
+	client := NewTypedClientWithClientsets(
+		harvesterfake.NewSimpleClientset(),
+		kubefake.NewSimpleClientset(
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pg-orders-os-v20260615", Namespace: "tenant-a"}},
+		),
+		kvfake.NewSimpleClientset(),
+		cdifake.NewSimpleClientset(),
+		"",
+	)
+
+	refs := dbaasv1.ResourceRefs{VMName: "pg-orders"} // no OSDiskPVCName — pre-fix instance
+	names := client.collectDiskPVCNames(ctx, "orders", "tenant-a", refs)
+
+	found := false
+	for _, n := range names {
+		if n == "pg-orders-os-v20260615" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("collectDiskPVCNames(%v) = %v, want it to still find the pre-fix orphan pg-orders-os-v20260615", refs, names)
+	}
+}
+
 func newTestTypedClient(objs ...runtime.Object) *TypedClient {
-	return NewTypedClientWithClientsets(harvesterfake.NewSimpleClientset(objs...), kubefake.NewSimpleClientset(), kvfake.NewSimpleClientset(), "")
+	return NewTypedClientWithClientsets(harvesterfake.NewSimpleClientset(objs...), kubefake.NewSimpleClientset(), kvfake.NewSimpleClientset(), cdifake.NewSimpleClientset(), "")
 }
 
 func findPVCTemplate(pvcs []*corev1.PersistentVolumeClaim, name string) *corev1.PersistentVolumeClaim {
@@ -593,8 +732,8 @@ func vmInterfaceHasPort(vm *kubevirtv1.VirtualMachine, interfaceName string, por
 func testTypedVMImage() *harvesterhciov1beta1.VirtualMachineImage {
 	return &harvesterhciov1beta1.VirtualMachineImage{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "harvesterhci.io/v1beta1", Kind: "VirtualMachineImage"},
-		ObjectMeta: metav1.ObjectMeta{Name: "ubuntu-22.04", Namespace: "default"},
-		Spec:       harvesterhciov1beta1.VirtualMachineImageSpec{DisplayName: "Ubuntu 22.04"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ubuntu-2204-postgres-v20260615", Namespace: "default"},
+		Spec:       harvesterhciov1beta1.VirtualMachineImageSpec{DisplayName: "Ubuntu 22.04 PostgreSQL v20260615"},
 		Status: harvesterhciov1beta1.VirtualMachineImageStatus{
 			StorageClassName: "longhorn-image-ubuntu",
 			Conditions: []harvesterhciov1beta1.Condition{

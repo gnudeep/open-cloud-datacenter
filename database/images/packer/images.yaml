@@ -1,0 +1,24 @@
+# build.sh reads this — add new versions here only, nothing else needs changing.
+#Update this image.yaml file and then run ./build.sh <build_date> [pg_versions] [os_version] command to build images.
+# eg: ./build.sh 20260615 "14 15" "20.04"
+
+os_streams:
+  "22.04":
+    iso_url: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+    checksum_url: "file:https://cloud-images.ubuntu.com/releases/22.04/release/SHA256SUMS"
+    eol: "2027-04-01"
+  "24.04":
+    iso_url: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    checksum_url: "file:https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS"
+    eol: "2029-04-01"
+  "26.04":
+    iso_url: "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
+    checksum_url: "file:https://cloud-images.ubuntu.com/releases/26.04/release/SHA256SUMS"
+    eol: "2031-04-01"
+
+pg_versions:
+  "14": { eol: "2024-11-14" }
+  "15": { eol: "2027-11-11" }
+  "16": { eol: "2028-11-09" }
+  "17": { eol: "2029-11-13" }
+  "18": { eol: "2030-11-14" }

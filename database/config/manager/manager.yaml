@@ -66,6 +66,9 @@ spec:
           # KubeOVN logical switch for launcher pod mgmt-NIC pinning.
           # Change to your cluster's management switch name for VPC setups.
           - --mgmt-logical-switch=ovn-default
+        env:
+        - name: BACKING_IMAGE_OS_VERSION
+          value: "24.04"      
         image: controller:latest
         name: manager
         env:

@@ -63,7 +63,7 @@ spec:
                 - implemented mutable post-create: dbInstanceClass, allocatedStorage,
                   running, deletionProtection
                 - implemented immutable post-create (modify is refused): networkRef,
-                  osImage, dbName, masterUsername, port, storageType, staticNetwork,
+                  dbName, masterUsername, port, storageType, staticNetwork,
                   vmPassword, engineVersion
                 - NOT IMPLEMENTED: manageMasterUserPassword, masterUserPasswordRef,
                   multiAZ, dbParameterGroupRef, tags, s3BackupConfig,
@@ -139,6 +139,7 @@ spec:
                   KubeVirt's default DNS behaviour (correct for cluster-routable VLANs).
                 type: string
               engineVersion:
+                default: "17"
                 description: |-
                   EngineVersion is the PostgreSQL major version, e.g. "16".
                   NOT YET IMPLEMENTED: cloud-init installs whatever PostgreSQL the OS
@@ -193,10 +194,10 @@ spec:
                 description: |-
                   NetworkRef is a Harvester NAD reference (namespace/name) for the VLAN
                   network the database VM attaches to. This is the VM's only network
-                  interface: client traffic, package install during cloud-init, and the
-                  Prometheus metrics scrape all go through it. The NAD must already exist
-                  on the cluster (the controller does not create networks) and the VLAN
-                  must have internet egress.
+                  interface: client traffic and the Prometheus metrics scrape go through it.
+                  The NAD must already exist on the cluster (the controller does not create
+                  networks). No internet egress required — packages are pre-installed in the
+                  baked image.
                   Immutable after first reconcile.
                   Example: "iaas-net/vm-subnet-001".
                 pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?\/[a-z0-9]([-a-z0-9]*[a-z0-9])?$
@@ -333,11 +334,16 @@ spec:
                     type: string
                   engineVersion:
                     type: string
+                  imageRevision:
+                    description: |-
+                      ImageRevision is the baked image revision the VM was provisioned or last
+                      repaved with, e.g. "v20260615". Used for drift detection — when this
+                      differs from the current LatestBakedImages revision, OSUpdateAvailable
+                      is set to True.
+                    type: string
                   masterUsername:
                     type: string
                   networkRef:
-                    type: string
-                  osImage:
                     type: string
                   port:
                     type: integer

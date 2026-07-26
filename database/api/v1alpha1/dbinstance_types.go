@@ -26,7 +26,7 @@ import (
 //   - implemented mutable post-create: dbInstanceClass, allocatedStorage,
 //     running, deletionProtection
 //   - implemented immutable post-create (modify is refused): networkRef,
-//     osImage, dbName, masterUsername, port, storageType, staticNetwork,
+//     dbName, masterUsername, port, storageType, staticNetwork,
 //     vmPassword, engineVersion
 //   - NOT IMPLEMENTED: manageMasterUserPassword, masterUserPasswordRef,
 //     multiAZ, dbParameterGroupRef, tags, s3BackupConfig,
@@ -154,19 +154,12 @@ type DBInstanceSpec struct {
 	// +optional
 	Running *bool `json:"running,omitempty"`
 
-	// OSImage is the Harvester VirtualMachineImage to clone for the VM's
-	// OS disk. Either "<ns>/<name>" or just "<name>" (resolved in the
-	// "default" namespace), or the image's spec.displayName.
-	// Immutable after first reconcile.
-	// +optional
-	OSImage string `json:"osImage,omitempty"`
-
 	// NetworkRef is a Harvester NAD reference (namespace/name) for the VLAN
 	// network the database VM attaches to. This is the VM's only network
-	// interface: client traffic, package install during cloud-init, and the
-	// Prometheus metrics scrape all go through it. The NAD must already exist
-	// on the cluster (the controller does not create networks) and the VLAN
-	// must have internet egress.
+	// interface: client traffic and the Prometheus metrics scrape go through it.
+	// The NAD must already exist on the cluster (the controller does not create
+	// networks). No internet egress required — packages are pre-installed in the
+	// baked image.
 	// Immutable after first reconcile.
 	// Example: "iaas-net/vm-subnet-001".
 	// +required
@@ -336,8 +329,6 @@ type AppliedSpec struct {
 	// +optional
 	NetworkRef string `json:"networkRef,omitempty"`
 	// +optional
-	OSImage string `json:"osImage,omitempty"`
-	// +optional
 	DBName string `json:"dbName,omitempty"`
 	// +optional
 	MasterUsername string `json:"masterUsername,omitempty"`
@@ -493,6 +484,58 @@ var InstanceClasses = map[string]InstanceClassSpec{
 	"db.r5.large":   {2, 16384, 300},
 	"db.r5.xlarge":  {4, 32768, 500},
 	"db.r5.2xlarge": {8, 65536, 800},
+}
+
+// BakedImageEntry describes a single baked image revision.
+type BakedImageEntry struct {
+	ImageName  string   // Harvester VirtualMachineImage name, e.g. "ubuntu-2204-postgres-v20260615"
+	OSVersion  string   // Ubuntu LTS stream, e.g. "22.04"
+	PGVersions []string // PG major versions pre-installed, e.g. ["15", "16", "17"]
+}
+
+// BakedImageStream is the per-OS-stream entry in LatestBakedImages.
+// Validated must be true before the operator uses this stream for new VMs.
+type BakedImageStream struct {
+	Revision  string // e.g. "v20260615"
+	Validated bool   // false = image under test, not safe to provision against
+}
+
+// BakedImages is the catalog of all baked image revisions ever published.
+// Old entries are kept so existing VMs can reference their creation-time revision
+// in status.appliedSpec.imageRevision for drift detection.
+// To add a new revision: add one entry here and bump LatestBakedImages.
+var BakedImages = map[string]BakedImageEntry{
+	"v20260515": {
+		ImageName:  "ubuntu-2204-postgres-v20260515",
+		OSVersion:  "22.04",
+		PGVersions: []string{"15", "16", "17"},
+	},
+	"v20260701": {
+		ImageName:  "ubuntu-2404-postgres-v20260701",
+		OSVersion:  "24.04",
+		PGVersions: []string{"15", "16", "17", "18"},
+	},
+}
+
+// LatestBakedImages maps OS stream → current validated revision. Exactly ONE
+// entry per OS stream — this is a pointer to the active revision, not a
+// history (that's what BakedImages is for). To publish a new revision for a
+// stream you already have, EDIT that stream's existing entry in place; do not
+// add a second map entry for the same key. Go map literals reject duplicate
+// keys at compile time anyway ("duplicate key ... in map literal"), so this
+// self-enforces — but the failure mode to avoid is reasoning about it as
+// "add a row" when it's really "update the pointer".
+//
+// DefaultOSVersion is read from the BACKING_IMAGE_OS_VERSION operator env var —
+// flip the env var to change the default stream without a code change.
+// Both new-instance provisioning (phaseVM) and drift detection (phaseAvailable)
+// gate on the SAME Validated flag for a stream, so add new streams with
+// Validated: false until the image has been smoke-tested outside the operator
+// (e.g. a VM created directly in Harvester), then flip true — there is no
+// partial state where one path sees it validated and the other doesn't.
+var LatestBakedImages = map[string]BakedImageStream{
+	"22.04": {Revision: "v20260515", Validated: true},
+	"24.04": {Revision: "v20260701", Validated: true},
 }
 
 func init() {

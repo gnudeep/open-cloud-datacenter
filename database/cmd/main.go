@@ -236,6 +236,7 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "dbinstance")
 		os.Exit(1)
 	}
+
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

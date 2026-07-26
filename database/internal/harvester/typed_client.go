@@ -37,6 +37,7 @@ import (
 
 	harvesterhciov1beta1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	harvesterclientset "github.com/harvester/harvester/pkg/generated/clientset/versioned"
+	cdiclientset "kubevirt.io/client-go/containerizeddataimporter"
 	kvclientset "kubevirt.io/client-go/kubevirt"
 )
 
@@ -55,6 +56,7 @@ type TypedClient struct {
 	Clientset         harvesterclientset.Interface
 	KubeClient        kubernetes.Interface
 	KvClientset       kvclientset.Interface
+	CdiClientset      cdiclientset.Interface
 	GrafanaURL        string
 	MgmtLogicalSwitch string
 }
@@ -74,11 +76,15 @@ func NewTypedClient(config *rest.Config, grafanaURL string) (*TypedClient, error
 	if err != nil {
 		return nil, err
 	}
-	return NewTypedClientWithClientsets(clientset, kubeClient, kvClientset, grafanaURL), nil
+	cdiClient, err := cdiclientset.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return NewTypedClientWithClientsets(clientset, kubeClient, kvClientset, cdiClient, grafanaURL), nil
 }
 
-func NewTypedClientWithClientsets(clientset harvesterclientset.Interface, kubeClient kubernetes.Interface, kvClientset kvclientset.Interface, grafanaURL string) *TypedClient {
-	return &TypedClient{Clientset: clientset, KubeClient: kubeClient, KvClientset: kvClientset, GrafanaURL: grafanaURL}
+func NewTypedClientWithClientsets(clientset harvesterclientset.Interface, kubeClient kubernetes.Interface, kvClientset kvclientset.Interface, cdiClient cdiclientset.Interface, grafanaURL string) *TypedClient {
+	return &TypedClient{Clientset: clientset, KubeClient: kubeClient, KvClientset: kvClientset, CdiClientset: cdiClient, GrafanaURL: grafanaURL}
 }
 
 func (c *TypedClient) ResizeDataVolume(ctx context.Context, ns, vmName, dvName string, newSizeGB int) error {
@@ -275,6 +281,14 @@ func (c *TypedClient) ResizeVM(ctx context.Context, ns, vmName string, cpuCores,
 
 // Deploy the prometheus monitoring stack. Discussion : Harvester already have Prometheus operator, what to do ?
 func (c *TypedClient) TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.ResourceRefs) error {
+	// Disk PVCs are created by Harvester from the VM's volumeClaimTemplates
+	// annotation with no ownerReferences, so deleting the VM does NOT delete
+	// them — they must be deleted explicitly here or they orphan (and a
+	// later same-named DBInstance silently reattaches the old OS disk).
+	// Collect their names from the live VM first; if the VM is already gone,
+	// fall back to the naming conventions.
+	diskPVCs := c.collectDiskPVCNames(ctx, id, ns, refs)
+
 	type deleteTask struct {
 		resource string
 		name     string
@@ -302,6 +316,20 @@ func (c *TypedClient) TeardownAll(ctx context.Context, id, ns string, refs dbaas
 		{"secrets", refs.CloudInitSecretName, func() error {
 			return c.KubeClient.CoreV1().Secrets(ns).Delete(ctx, refs.CloudInitSecretName, metav1.DeleteOptions{})
 		}},
+	}
+	for _, pvcName := range diskPVCs {
+		name := pvcName
+		// Stray DataVolume first: the buggy DVT-based repave may have left a DV
+		// that adopted the PVC; deleting the DV releases/cascades it, and the
+		// direct PVC delete below covers the ownerless case. Both ignore NotFound.
+		tasks = append(tasks,
+			deleteTask{"datavolumes", name, func() error {
+				return c.DeleteDataVolume(ctx, ns, name)
+			}},
+			deleteTask{"persistentvolumeclaims", name, func() error {
+				return c.DeletePVC(ctx, ns, name)
+			}},
+		)
 	}
 
 	var (

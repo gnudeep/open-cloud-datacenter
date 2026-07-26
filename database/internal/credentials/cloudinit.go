@@ -176,6 +176,7 @@ ssh_pwauth: true
       REPL_PASSWORD=%s
       EXPORTER_PASSWORD=%s
       MAX_CONNECTIONS=%d
+      ENGINE_VERSION=%s
       %s
   - path: /etc/ssl/certs/pg-ca.crt
     encoding: b64
@@ -196,15 +197,14 @@ ssh_pwauth: true
       set -euo pipefail
       source /etc/dbaas/bootstrap.env
 
-      # 1. Install PostgreSQL + helpers. Done here, not via cloud-init's
-      #    "packages:" directive, so it works on minimal cloud images
-      #    that don't load the package module.
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y postgresql postgresql-contrib jq qemu-guest-agent prometheus-postgres-exporter
-      systemctl enable --now qemu-guest-agent
-
-      PG_VER=$(pg_lsclusters -h | awk '{print $1}' | head -1)
+      # 1. Activate the requested PostgreSQL version.
+      # All versions are pre-installed in the baked image; drop all clusters
+      # created at package install time and create only the requested one.
+      for ver in $(pg_lsclusters -h | awk '{print $1}' | sort -u); do
+        pg_dropcluster --stop "$ver" main 2>/dev/null || true
+      done
+      pg_createcluster --start ${ENGINE_VERSION} main
+      PG_VER=${ENGINE_VERSION}
       PG_CONF="/etc/postgresql/${PG_VER}/main"
 
       # Move PostgreSQL data onto the dedicated pgdata disk before applying
@@ -260,6 +260,7 @@ ssh_pwauth: true
       echo "hostssl all all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
       echo "hostssl replication all 0.0.0.0/0 scram-sha-256" >> "${PG_CONF}/pg_hba.conf"
 
+      systemctl enable postgresql
       systemctl restart postgresql
 
       # Create admin user and database. The master user gets CREATEDB and
@@ -313,6 +314,7 @@ final_message: "DBaaS bootstrap complete for %s"
 		m.ReplPassword,
 		m.ExporterPassword,
 		p.MaxConnections,
+		p.EngineVersion,
 		backupConfig,
 		caCertB64,
 		serverCertB64,

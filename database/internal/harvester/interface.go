@@ -50,6 +50,30 @@ type ClientInterface interface {
 	// method. TeardownAll still deletes them by ref as the finalizer's
 	// authoritative cleanup; owner-ref GC is the backup.
 	TeardownAll(ctx context.Context, id, ns string, refs dbaasv1.ResourceRefs) error
+
+	// Repave helpers — used by phaseRepave() to swap the OS disk.
+	// ClearDataVolumeOwnerRef removes all ownerReferences from a DataVolume so
+	// it is not cascade-deleted when the VM CR is patched during repave.
+	ClearDataVolumeOwnerRef(ctx context.Context, ns, dvName string) error
+	// DeleteDataVolume deletes a DataVolume by name. NotFound is treated as success.
+	DeleteDataVolume(ctx context.Context, ns, dvName string) error
+	// DeletePVC deletes a PersistentVolumeClaim by name. NotFound is treated as
+	// success. Needed because Harvester creates disk PVCs (from the VM's
+	// volumeClaimTemplates annotation) without ownerReferences, so nothing
+	// cascade-deletes them — explicit deletion is the only way they go away.
+	DeletePVC(ctx context.Context, ns, name string) error
+	// SwapVMOSDisk points the VM's OS disk at a fresh, revision-suffixed disk
+	// (pg-<id>-os-<rev>) provisioned from the image referenced by imgRef (name
+	// or displayName in namespace default). The storageClass is resolved from
+	// the image's own status.storageClassName, so this works whether the image
+	// was uploaded via kubectl (metadata.name matches) or the Harvester UI
+	// (auto-generated name, displayName matches). Returns the disk it replaced
+	// (oldDiskName, "" when the VM is already on the target disk) so the
+	// caller can delete it — the two names never collide, which is what makes
+	// the swap race-free — and the disk it's now on (newDiskName, always set,
+	// including on the no-op path), which the caller should persist to
+	// status.resources.osDiskPVCName as the authoritative current name.
+	SwapVMOSDisk(ctx context.Context, ns, vmName, instID, imgRef string) (oldDiskName, newDiskName string, err error)
 }
 
 // ResolvedVMImage contains the provider-neutral image fields needed to build a
